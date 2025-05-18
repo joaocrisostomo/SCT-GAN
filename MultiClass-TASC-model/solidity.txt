@@ -1,0 +1,6 @@
+sudo add-apt-repository ppa:ethereum/ethereum && sudo apt-get update && sudo apt-get install solc
+
+OR
+
+mkdir -p ~/.local/bin && npm install --prefix ~/.local solc
+export PATH=$PATH:~/.local/bin && which solc
