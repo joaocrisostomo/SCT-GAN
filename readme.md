@@ -57,3 +57,11 @@ The model also outputs high-level **latent representations** for use in a downst
          +---------------+-----------------+
          | Output Layer (Token Generation) |
          +----------------------------------+
+```
+---
+
+# 🧪 Research Contributions
+*Novel GAN setup for smart contract synthesis and analysis.
+*Transformer-based vulnerability detection, including attention analysis for localization.
+*Supports both generation and discrimination tasks in adversarial settings.
+
