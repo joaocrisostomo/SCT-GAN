@@ -61,7 +61,7 @@ The model also outputs high-level **latent representations** for use in a downst
 ---
 
 # 🧪 Research Contributions
-*Novel GAN setup for smart contract synthesis and analysis.
-*Transformer-based vulnerability detection, including attention analysis for localization.
-*Supports both generation and discrimination tasks in adversarial settings.
+- Novel GAN setup for smart contract synthesis and analysis.
+- Transformer-based vulnerability detection, including attention analysis for localization.
+- Supports both generation and discrimination tasks in adversarial settings.
 
