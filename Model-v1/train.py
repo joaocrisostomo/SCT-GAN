@@ -47,13 +47,16 @@ class SmartContractTrainer:
         d_model=768,
         gpu_id=1  # Add GPU ID parameter
     ):
-        self.model = model
+
+        self.device = torch.device(f'cuda:{gpu_id}')
+        self.model = model.to(self.device)
+        
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.gpu_id = gpu_id
         
         # Initialize discriminator
-        self.discriminator = Discriminator(d_model=d_model)
+        self.discriminator = Discriminator(d_model=d_model).to(self.device)
         
         # Initialize loss functions
         self.criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
@@ -61,7 +64,7 @@ class SmartContractTrainer:
         
         # Optimizers
         self.optimizer = optim.AdamW(
-            model.parameters(),
+            self.model.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay
         )
@@ -93,16 +96,23 @@ class SmartContractTrainer:
             'synthetic_loss': []
         }
         
-        # Set CUDA device
-        torch.cuda.set_device(self.gpu_id)
-        
         # Set memory allocation strategy
         torch.cuda.empty_cache()
         torch.backends.cudnn.benchmark = True
         
         # Initialize scaler for mixed precision training
         self.scaler = torch.cuda.amp.GradScaler()
+
+        # Add penalty parameters
+        self.lambda_d = 0.1  # Penalty strength for discriminator
+        self.lambda_g = 0.1  # Penalty strength for generator
+        self.delta_d = 0.3   # Threshold for discriminator loss
+        self.delta_g = 0.3   # Threshold for generator loss
     
+    def compute_penalty(self, loss, lambda_param, delta):
+        """Compute the penalty term for a given loss"""
+        return lambda_param * torch.pow(torch.clamp(delta - loss, min=0), 2)
+
     def train_epoch(self):
         self.model.train()
         self.discriminator.train()
@@ -110,11 +120,6 @@ class SmartContractTrainer:
         total_vuln_loss = 0
         total_synth_loss = 0
         batch_count = 0
-        
-        # Move models to specified GPU
-        device = torch.device(f"cuda:{self.gpu_id}")
-        self.model = self.model.to(device)
-        self.discriminator = self.discriminator.to(device)
         
         progress_bar = tqdm(self.train_dataloader, desc='Training')
         
@@ -124,14 +129,17 @@ class SmartContractTrainer:
                 torch.cuda.empty_cache()
                 
                 # Move all tensors to the same device
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                path_input_ids = batch['path_input_ids'].to(device)
-                path_attention_mask = batch['path_attention_mask'].to(device)
-                target_ids = batch['target_ids'].to(device)
+                batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
+                        for k, v in batch.items()}
+                
+                input_ids = batch['input_ids']
+                attention_mask = batch['attention_mask']
+                path_input_ids = batch['path_input_ids']
+                path_attention_mask = batch['path_attention_mask']
+                target_ids = batch['target_ids']
                 
                 # Convert label to vulnerability indicator and reshape
-                is_vulnerable = batch['label'].float().to(device).view(-1, 1)
+                is_vulnerable = batch['label'].float().view(-1, 1)
                 
                 # Train discriminator
                 self.discriminator_optimizer.zero_grad()
@@ -179,6 +187,8 @@ class SmartContractTrainer:
                     
                     # Combined discriminator loss
                     d_loss = (vuln_loss_real + synth_loss_real + vuln_loss_synth + synth_loss_synth) / 2
+                    d_penalty = self.compute_penalty(d_loss, self.lambda_d, self.delta_d)
+                    d_loss = d_loss + d_penalty
                 
                 # Backward pass for discriminator with gradient scaling
                 self.scaler.scale(d_loss).backward()
@@ -211,8 +221,24 @@ class SmartContractTrainer:
                     adv_synth_loss = self.bce_loss(synth_pred, torch.zeros_like(synth_pred))
                     diversity_loss = -torch.mean(torch.abs(synthetic_encoder_output - encoder_output.detach()))
                     
-                    # Combined generator loss
-                    total_loss = gen_loss + 0.1 * (adv_vuln_loss + adv_synth_loss) + 0.05 * diversity_loss
+                    # Old loss function:
+                    #total_loss = gen_loss + 0.1 * (adv_vuln_loss + adv_synth_loss) + 0.05 * diversity_loss
+
+                    g_loss = gen_loss + 0.1 * (adv_vuln_loss + adv_synth_loss) + 0.05 * diversity_loss
+                    g_penalty = self.compute_penalty(g_loss, self.lambda_g, self.delta_g)
+                    total_loss = g_loss + g_penalty
+                    
+                    # Update progress bar with penalty information
+                    progress_bar.set_postfix({
+                        'gen_loss': gen_loss.item(),
+                        'vuln_loss': (vuln_loss_real.item() + vuln_loss_synth.item()) / 2,
+                        'synth_loss': (synth_loss_real.item() + synth_loss_synth.item()) / 2,
+                        'diversity_loss': diversity_loss.item(),
+                        'd_penalty': d_penalty.item(),
+                        'g_penalty': g_penalty.item(),
+                        'is_synthetic': is_synthetic.mean().item()
+                    })
+ 
                 
                 # Backward pass for generator with gradient scaling
                 self.scaler.scale(total_loss).backward()
@@ -231,15 +257,6 @@ class SmartContractTrainer:
                 total_synth_loss += (synth_loss_real.item() + synth_loss_synth.item()) / 2
                 batch_count += 1
                 
-                # Update progress bar
-                progress_bar.set_postfix({
-                    'gen_loss': gen_loss.item(),
-                    'vuln_loss': (vuln_loss_real.item() + vuln_loss_synth.item()) / 2,
-                    'synth_loss': (synth_loss_real.item() + synth_loss_synth.item()) / 2,
-                    'diversity_loss': diversity_loss.item(),
-                    'is_synthetic': is_synthetic.mean().item()
-                })
-                
                 # Clear some memory
                 del outputs, synthetic_outputs, encoder_output, synthetic_encoder_output
                 torch.cuda.empty_cache()
@@ -251,8 +268,8 @@ class SmartContractTrainer:
                 print(f"Label type: {batch['label'].dtype if 'label' in batch else 'No label'}")
                 print(f"Vuln pred shape: {vuln_pred.shape if 'vuln_pred' in locals() else 'Not created'}")
                 print(f"Synth pred shape: {synth_pred.shape if 'synth_pred' in locals() else 'Not created'}")
-                print(f"GPU Memory: {torch.cuda.memory_allocated(device) / 1024**2:.2f}MB allocated")
-                print(f"GPU Memory: {torch.cuda.memory_reserved(device) / 1024**2:.2f}MB reserved")
+                print(f"GPU Memory: {torch.cuda.memory_allocated(self.device) / 1024**2:.2f}MB allocated")
+                print(f"GPU Memory: {torch.cuda.memory_reserved(self.device) / 1024**2:.2f}MB reserved")
                 continue
         
         return {
