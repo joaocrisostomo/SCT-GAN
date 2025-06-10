@@ -62,10 +62,10 @@ class SmartContractTrainer:
         self.criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
         self.bce_loss = nn.BCEWithLogitsLoss()  # Changed to BCEWithLogitsLoss
         
-        # Optimizers
+        # Optimizers - use much lower learning rate
         self.optimizer = optim.AdamW(
             self.model.parameters(),
-            lr=learning_rate,
+            lr=learning_rate,  # This should be around 1e-4, not 0.1
             weight_decay=weight_decay
         )
         
@@ -106,8 +106,8 @@ class SmartContractTrainer:
         # Add penalty parameters
         self.lambda_d = 0.1  # Penalty strength for discriminator
         self.lambda_g = 0.1  # Penalty strength for generator
-        self.delta_d = 0.3   # Threshold for discriminator loss
-        self.delta_g = 0.3   # Threshold for generator loss
+        self.delta_d = 0.2   # Threshold for discriminator loss
+        self.delta_g = 0.2   # Threshold for generator loss
     
     def compute_penalty(self, loss, lambda_param, delta):
         """Compute the penalty term for a given loss"""
@@ -200,8 +200,22 @@ class SmartContractTrainer:
                 
                 with torch.cuda.amp.autocast():
                     logits = outputs['logits']
-                    target_ids = target_ids[:, 1:].contiguous().view(-1)
-                    gen_loss = self.criterion(logits, target_ids)
+                    # Use the processed target_ids from the model output
+                    processed_target_ids = outputs['target_ids']
+
+                    if torch.isnan(logits).any() or torch.isinf(logits).any():
+                        print("Warning: NaN or Inf detected in logits")
+                        continue
+                        
+                    if torch.isnan(processed_target_ids).any() or torch.isinf(processed_target_ids).any():
+                        print("Warning: NaN or Inf detected in processed_target_ids")
+                        continue
+                    
+                    gen_loss = self.criterion(logits, processed_target_ids)
+
+                    if torch.isnan(gen_loss) or torch.isinf(gen_loss):
+                        print(f"Warning: Invalid gen_loss detected: {gen_loss.item()}")
+                        continue
                     
                     # Generate new synthetic data for generator training
                     synthetic_outputs = self.model(
@@ -312,8 +326,9 @@ class SmartContractTrainer:
                     
                     # Calculate generator loss
                     logits = outputs['logits']
-                    target_ids = target_ids[:, 1:].contiguous().view(-1)
-                    gen_loss = self.criterion(logits, target_ids)
+                    # Use the processed target_ids from the model output
+                    processed_target_ids = outputs['target_ids']
+                    gen_loss = self.criterion(logits, processed_target_ids)
                     
                     # Discriminator predictions
                     vuln_pred, synth_pred = self.discriminator(outputs['encoder_output'])

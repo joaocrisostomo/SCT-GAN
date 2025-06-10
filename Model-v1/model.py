@@ -12,7 +12,7 @@ class SmartContractTransformer(nn.Module):
         num_decoder_layers=6,
         dim_feedforward=2048,
         dropout=0.1,
-        max_length=256,  # Match your dataset's max_length
+        max_length=512,  # Match your dataset's max_length
         vocab_size=50265  # Match your tokenizer's vocab size
     ):
         super().__init__()
@@ -58,6 +58,14 @@ class SmartContractTransformer(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+            else:
+                # Initialize biases to small values
+                nn.init.constant_(p, 0.0)
+        
+        # Initialize embeddings with smaller variance for stability
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.path_embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.pos_encoder.weight, mean=0.0, std=0.02)
                 
     def generate_square_subsequent_mask(self, sz):
         """Generate a square mask for the sequence"""
@@ -76,26 +84,47 @@ class SmartContractTransformer(nn.Module):
         """
         device = input_ids.device
         batch_size = input_ids.size(0)
+        seq_len = input_ids.size(1)
         
-        # Create position indices
-        src_pos = torch.arange(0, input_ids.size(1), device=device).unsqueeze(0).expand(batch_size, -1)
+        # Create position indices for contract tokens
+        contract_pos = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
         
         # Contract embeddings
         contract_emb = self.embedding(input_ids) * (self.d_model ** 0.5)
-        contract_emb = contract_emb + self.pos_encoder(src_pos)
+        contract_emb = contract_emb + self.pos_encoder(contract_pos)
         
-        # Path embeddings
+        # Path embeddings with proper position indices
+        path_pos = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
         path_emb = self.path_embedding(path_input_ids) * (self.d_model ** 0.5)
-        path_emb = path_emb + self.pos_encoder(src_pos)
+        path_emb = path_emb + self.pos_encoder(path_pos)
         
         # Combine contract and path embeddings
         src_emb = torch.cat([contract_emb, path_emb], dim=1)
         
+        # Create position indices for the concatenated sequence
+        combined_seq_len = 2 * seq_len
+        if combined_seq_len > self.max_length:
+            # Truncate if too long
+            truncate_len = self.max_length // 2
+            src_emb = torch.cat([
+                contract_emb[:, :truncate_len, :], 
+                path_emb[:, :truncate_len, :]
+            ], dim=1)
+            combined_seq_len = self.max_length
+        
         # Create source mask - ensure it's 2D
         if attention_mask is not None and path_attention_mask is not None:
-            src_mask = torch.cat([attention_mask, path_attention_mask], dim=1)  # [batch_size, 2*seq_len]
+            if combined_seq_len < 2 * seq_len:
+                # Truncate masks if we truncated embeddings
+                truncate_len = combined_seq_len // 2
+                src_mask = torch.cat([
+                    attention_mask[:, :truncate_len], 
+                    path_attention_mask[:, :truncate_len]
+                ], dim=1)
+            else:
+                src_mask = torch.cat([attention_mask, path_attention_mask], dim=1)
         else:
-            src_mask = (input_ids != 0)  # [batch_size, seq_len]
+            src_mask = torch.ones((batch_size, combined_seq_len), dtype=torch.bool, device=device)
         
         # Encode - use the 2D mask directly
         memory = self.encoder(src_emb, src_key_padding_mask=~src_mask)
@@ -103,7 +132,7 @@ class SmartContractTransformer(nn.Module):
         if target_ids is None:
             # Generate sequence
             tgt = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
-            max_len = self.max_length
+            max_len = min(self.max_length, 50)  # Limit generation length to prevent infinite loops
             
             for _ in range(max_len - 1):
                 tgt_mask = self.generate_square_subsequent_mask(tgt.size(1)).to(device)
@@ -136,11 +165,13 @@ class SmartContractTransformer(nn.Module):
             }
             
         else:
-            # Training mode
-            tgt_pos = torch.arange(0, target_ids.size(1), device=device).unsqueeze(0).expand(batch_size, -1)
-            tgt_mask = self.generate_square_subsequent_mask(target_ids.size(1)).to(device)
+            # Training mode - use a copy of target_ids to avoid modifying the original
+            target_ids_copy = target_ids.clone()
             
-            tgt_emb = self.embedding(target_ids) * (self.d_model ** 0.5)
+            tgt_pos = torch.arange(0, target_ids_copy.size(1), device=device).unsqueeze(0).expand(batch_size, -1)
+            tgt_mask = self.generate_square_subsequent_mask(target_ids_copy.size(1)).to(device)
+            
+            tgt_emb = self.embedding(target_ids_copy) * (self.d_model ** 0.5)
             tgt_emb = tgt_emb + self.pos_encoder(tgt_pos)
             
             out = self.decoder(
@@ -154,17 +185,17 @@ class SmartContractTransformer(nn.Module):
             
             # Reshape logits and target_ids to match
             # Remove the first token from target_ids (shift right)
-            target_ids = target_ids[:, 1:].contiguous()
+            shifted_target_ids = target_ids_copy[:, 1:].contiguous()
             
             # Reshape both to [batch_size * (seq_len-1), vocab_size]
             logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
-            target_ids = target_ids.view(-1)
+            shifted_target_ids = shifted_target_ids.view(-1)
             
             # Get the mean of the encoder output for the discriminator
             encoder_output = torch.mean(memory, dim=1)  # [batch_size, d_model]
             
             return {
                 'logits': logits,
-                'target_ids': target_ids,
+                'target_ids': shifted_target_ids,
                 'encoder_output': encoder_output
             } 
