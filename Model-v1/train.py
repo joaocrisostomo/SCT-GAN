@@ -1,417 +1,358 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import time
-from datetime import datetime
-import os
-import numpy as np
-from tqdm import tqdm
+from torch.nn import TransformerEncoder, TransformerDecoder, TransformerEncoderLayer, TransformerDecoderLayer
+from transformers import AutoModel, AutoTokenizer
 
-class Discriminator(nn.Module):
-    def __init__(self, d_model=768, hidden_size=512):
-        super().__init__()
-        
-        # Shared layers for feature extraction
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(d_model, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-        
-        # Vulnerability detection head (without sigmoid)
-        self.vulnerability_head = nn.Linear(hidden_size // 2, 1)
-        
-        # Synthetic data detection head (without sigmoid)
-        self.synthetic_head = nn.Linear(hidden_size // 2, 1)
-        
-    def forward(self, x):
-        features = self.feature_extractor(x)
-        vulnerability_logits = self.vulnerability_head(features)
-        synthetic_logits = self.synthetic_head(features)
-        return vulnerability_logits, synthetic_logits
-
-class SmartContractTrainer:
+class SmartContractTransformer(nn.Module):
     def __init__(
         self,
-        model,
-        train_dataloader,
-        val_dataloader,
-        learning_rate=0.0001,
-        weight_decay=0.01,
-        max_grad_norm=1.0,
-        pad_token_id=0,
-        d_model=768,
-        gpu_id=1  # Add GPU ID parameter
+        d_model=768,  # Hidden size for embeddings and transformer layers
+        nhead=8,
+        num_encoder_layers=6,
+        num_decoder_layers=6,
+        dim_feedforward=2048,
+        dropout=0.1,
+        max_length=1024,  # Match your dataset's max_length
+        vocab_size=50265  # Match your tokenizer's vocab size
     ):
-
-        self.device = torch.device(f'cuda:{gpu_id}')
-        self.model = model.to(self.device)
+        super().__init__()
         
-        self.train_dataloader = train_dataloader
-        self.val_dataloader = val_dataloader
-        self.gpu_id = gpu_id
+        # Token embedding with layer normalization
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.embedding_norm = nn.LayerNorm(d_model)
+        self.pos_encoder = nn.Embedding(max_length, d_model)
         
-        # Initialize discriminator
-        self.discriminator = Discriminator(d_model=d_model).to(self.device)
+        # Path embedding with layer normalization
+        self.path_embedding = nn.Embedding(vocab_size, d_model)
+        self.path_embedding_norm = nn.LayerNorm(d_model)
         
-        # Initialize loss functions
-        self.criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
-        self.bce_loss = nn.BCEWithLogitsLoss()  # Changed to BCEWithLogitsLoss
-        
-        # Optimizers - use much lower learning rate
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=learning_rate,  # This should be around 1e-4, not 0.1
-            weight_decay=weight_decay
+        # Transformer encoder with improved configuration
+        encoder_layer = TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            activation='gelu'  # Using GELU activation for better performance
         )
+        self.encoder = TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
         
-        self.discriminator_optimizer = optim.AdamW(
-            self.discriminator.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay
+        # Transformer decoder with improved configuration
+        decoder_layer = TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            activation='gelu'
         )
+        self.decoder = TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
         
-        # Learning rate scheduler
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=3,
-            verbose=True
-        )
+        # Output projection with layer normalization
+        self.output_norm = nn.LayerNorm(d_model)
+        self.output_layer = nn.Linear(d_model, vocab_size)
         
-        self.max_grad_norm = max_grad_norm
+        self.d_model = d_model
+        self.max_length = max_length
+        self.vocab_size = vocab_size
         
-        # Training metrics
-        self.best_val_loss = float('inf')
-        self.training_history = {
-            'train_loss': [],
-            'val_loss': [],
-            'learning_rate': [],
-            'vulnerability_loss': [],
-            'synthetic_loss': []
-        }
+        # Initialize weights
+        self._init_weights()
         
-        # Set memory allocation strategy
-        torch.cuda.empty_cache()
-        torch.backends.cudnn.benchmark = True
+    def _init_weights(self):
+        """Initialize weights for better training stability"""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+            else:
+                nn.init.constant_(p, 0.0)
         
-        # Initialize scaler for mixed precision training
-        self.scaler = torch.cuda.amp.GradScaler()
+        # Initialize embeddings with smaller variance for stability
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.path_embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.pos_encoder.weight, mean=0.0, std=0.02)
+                
+    def generate_square_subsequent_mask(self, sz):
+        """Generate a square mask for the sequence"""
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+        
+    def forward(self, input_ids, attention_mask=None, path_input_ids=None, path_attention_mask=None, target_ids=None):
+        """
+        Args:
+            input_ids: Contract token ids [batch_size, seq_len]
+            attention_mask: Contract attention mask [batch_size, seq_len]
+            path_input_ids: Path token ids [batch_size, seq_len]
+            path_attention_mask: Path attention mask [batch_size, seq_len]
+            target_ids: Target token ids [batch_size, seq_len]
+        """
+        device = input_ids.device
+        batch_size = input_ids.size(0)
+        seq_len = input_ids.size(1)
+        
+        # Create position indices for contract tokens
+        contract_pos = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        
+        # Contract embeddings with normalization
+        contract_emb = self.embedding(input_ids) * (self.d_model ** 0.5)
+        contract_emb = self.embedding_norm(contract_emb)
+        contract_emb = contract_emb + self.pos_encoder(contract_pos)
+        
+        # Path embeddings with normalization
+        path_pos = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        path_emb = self.path_embedding(path_input_ids) * (self.d_model ** 0.5)
+        path_emb = self.path_embedding_norm(path_emb)
+        path_emb = path_emb + self.pos_encoder(path_pos)
+        
+        # Combine contract and path embeddings
+        src_emb = torch.cat([contract_emb, path_emb], dim=1)
+        
+        # Create position indices for the concatenated sequence
+        combined_seq_len = 2 * seq_len
+        if combined_seq_len > self.max_length:
+            # Truncate if too long
+            truncate_len = self.max_length // 2
+            src_emb = torch.cat([
+                contract_emb[:, :truncate_len, :], 
+                path_emb[:, :truncate_len, :]
+            ], dim=1)
+            combined_seq_len = self.max_length
+        
+        # Create source mask - ensure it's 2D
+        if attention_mask is not None and path_attention_mask is not None:
+            if combined_seq_len < 2 * seq_len:
+                # Truncate masks if we truncated embeddings
+                truncate_len = combined_seq_len // 2
+                src_mask = torch.cat([
+                    attention_mask[:, :truncate_len], 
+                    path_attention_mask[:, :truncate_len]
+                ], dim=1)
+            else:
+                src_mask = torch.cat([attention_mask, path_attention_mask], dim=1)
+        else:
+            src_mask = torch.ones((batch_size, combined_seq_len), dtype=torch.bool, device=device)
+        
+        # Encode with improved attention
+        memory = self.encoder(src_emb, src_key_padding_mask=~src_mask)
+        
+        if target_ids is None:
+            # Generate sequence with improved logic
+            tgt = torch.ones((batch_size, 1), dtype=torch.long, device=device)  # BOS token
+            max_len = min(self.max_length, 1024)  # Updated to match model's max_length
+            
+            # Improved generation parameters
+            temperature = 0.8  # Slightly lower temperature for more focused generation
+            top_k = 40  # Reduced top-k for more focused sampling
+            top_p = 0.9  # Nucleus sampling
+            
+            for i in range(max_len - 1):
+                tgt_mask = self.generate_square_subsequent_mask(tgt.size(1)).to(device)
+                tgt_pos = torch.arange(0, tgt.size(1), device=device).unsqueeze(0).expand(batch_size, -1)
+                
+                tgt_emb = self.embedding(tgt) * (self.d_model ** 0.5)
+                tgt_emb = self.embedding_norm(tgt_emb)
+                tgt_emb = tgt_emb + self.pos_encoder(tgt_pos)
+                
+                out = self.decoder(
+                    tgt_emb,
+                    memory,
+                    tgt_mask=tgt_mask,
+                    memory_key_padding_mask=~src_mask
+                )
+                
+                # Apply layer normalization before output projection
+                out = self.output_norm(out)
+                logits = self.output_layer(out[:, -1, :])
+                
+                # Apply temperature scaling
+                logits = logits / temperature
+                
+                # Apply top-k filtering
+                if top_k > 0:
+                    top_k_logits, top_k_indices = torch.topk(logits, top_k, dim=-1)
+                    logits_mask = torch.full_like(logits, float('-inf'))
+                    logits_mask.scatter_(-1, top_k_indices, top_k_logits)
+                    logits = logits_mask
+                
+                # Apply nucleus sampling
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits = logits.masked_fill(indices_to_remove, float('-inf'))
+                
+                # Sample from the distribution
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                
+                tgt = torch.cat([tgt, next_token], dim=1)
+                
+                # Improved stopping conditions
+                if (next_token == 2).any() or (next_token == 0).any():
+                    # Only stop if we've generated a reasonable amount of tokens
+                    if i > 30:  # Increased minimum length
+                        break
+                
+                # Emergency break for very short generations
+                if i > 10 and (next_token == 2).all():
+                    break
+            
+            # Get the mean of the encoder output for the discriminator
+            encoder_output = torch.mean(memory, dim=1)
+                    
+            return {
+                'generated_sequence': tgt,
+                'encoder_output': encoder_output
+            }
+            
+        else:
+            # Training mode with improved handling
+            target_ids_copy = target_ids.clone()
+            
+            tgt_pos = torch.arange(0, target_ids_copy.size(1), device=device).unsqueeze(0).expand(batch_size, -1)
+            tgt_mask = self.generate_square_subsequent_mask(target_ids_copy.size(1)).to(device)
+            
+            tgt_emb = self.embedding(target_ids_copy) * (self.d_model ** 0.5)
+            tgt_emb = self.embedding_norm(tgt_emb)
+            tgt_emb = tgt_emb + self.pos_encoder(tgt_pos)
+            
+            out = self.decoder(
+                tgt_emb,
+                memory,
+                tgt_mask=tgt_mask,
+                memory_key_padding_mask=~src_mask
+            )
+            
+            # Apply layer normalization before output projection
+            out = self.output_norm(out)
+            logits = self.output_layer(out)
+            
+            # Reshape logits and target_ids to match
+            shifted_target_ids = target_ids_copy[:, 1:].contiguous()
+            logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
+            shifted_target_ids = shifted_target_ids.view(-1)
+            
+            # Get the mean of the encoder output for the discriminator
+            encoder_output = torch.mean(memory, dim=1)
+            
+            return {
+                'logits': logits,
+                'target_ids': shifted_target_ids,
+                'encoder_output': encoder_output
+            }
 
-        # Add penalty parameters
-        self.lambda_d = 0.1  # Penalty strength for discriminator
-        self.lambda_g = 0.1  # Penalty strength for generator
-        self.delta_d = 0.2   # Threshold for discriminator loss
-        self.delta_g = 0.2   # Threshold for generator loss
-    
-    def compute_penalty(self, loss, lambda_param, delta):
-        """Compute the penalty term for a given loss"""
-        return lambda_param * torch.pow(torch.clamp(delta - loss, min=0), 2)
-
-    def train_epoch(self):
-        self.model.train()
-        self.discriminator.train()
-        total_loss = 0
-        total_vuln_loss = 0
-        total_synth_loss = 0
-        batch_count = 0
+    def generate_with_beam_search(self, input_ids, attention_mask, path_input_ids, path_attention_mask, 
+                                 beam_size=3, max_length=1024, temperature=1.0):
+        """
+        Generate sequences using beam search for better quality
+        """
+        device = input_ids.device
+        batch_size = input_ids.size(0)
+        seq_len = input_ids.size(1)
         
-        progress_bar = tqdm(self.train_dataloader, desc='Training')
+        # Encode the input (same as forward pass)
+        contract_pos = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        contract_emb = self.embedding(input_ids) * (self.d_model ** 0.5)
+        contract_emb = contract_emb + self.pos_encoder(contract_pos)
         
-        for batch in progress_bar:
-            try:
-                # Clear cache before each batch
-                torch.cuda.empty_cache()
-                
-                # Move all tensors to the same device
-                batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
-                        for k, v in batch.items()}
-                
-                input_ids = batch['input_ids']
-                attention_mask = batch['attention_mask']
-                path_input_ids = batch['path_input_ids']
-                path_attention_mask = batch['path_attention_mask']
-                target_ids = batch['target_ids']
-                
-                # Convert label to vulnerability indicator and reshape
-                is_vulnerable = batch['label'].float().view(-1, 1)
-                
-                # Train discriminator
-                self.discriminator_optimizer.zero_grad()
-                
-                with torch.cuda.amp.autocast():
-                    # Forward pass through generator
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        path_input_ids=path_input_ids,
-                        path_attention_mask=path_attention_mask,
-                        target_ids=target_ids
+        path_pos = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        path_emb = self.path_embedding(path_input_ids) * (self.d_model ** 0.5)
+        path_emb = path_emb + self.pos_encoder(path_pos)
+        
+        src_emb = torch.cat([contract_emb, path_emb], dim=1)
+        combined_seq_len = 2 * seq_len
+        
+        if combined_seq_len > self.max_length:
+            truncate_len = self.max_length // 2
+            src_emb = torch.cat([
+                contract_emb[:, :truncate_len, :], 
+                path_emb[:, :truncate_len, :]
+            ], dim=1)
+            combined_seq_len = self.max_length
+        
+        if attention_mask is not None and path_attention_mask is not None:
+            if combined_seq_len < 2 * seq_len:
+                truncate_len = combined_seq_len // 2
+                src_mask = torch.cat([
+                    attention_mask[:, :truncate_len], 
+                    path_attention_mask[:, :truncate_len]
+                ], dim=1)
+            else:
+                src_mask = torch.cat([attention_mask, path_attention_mask], dim=1)
+        else:
+            src_mask = torch.ones((batch_size, combined_seq_len), dtype=torch.bool, device=device)
+        
+        memory = self.encoder(src_emb, src_key_padding_mask=~src_mask)
+        
+        # Initialize beam search
+        # Each beam: (sequence, score)
+        beams = [[(torch.ones((1, 1), dtype=torch.long, device=device), 0.0)] for _ in range(batch_size)]
+        
+        for step in range(max_length - 1):
+            new_beams = [[] for _ in range(batch_size)]
+            
+            for batch_idx in range(batch_size):
+                for seq, score in beams[batch_idx]:
+                    if len(seq[0]) >= max_length or seq[0, -1].item() == 2:  # EOS token
+                        new_beams[batch_idx].append((seq, score))
+                        continue
+                    
+                    # Generate next token probabilities
+                    tgt_mask = self.generate_square_subsequent_mask(seq.size(1)).to(device)
+                    tgt_pos = torch.arange(0, seq.size(1), device=device).unsqueeze(0)
+                    
+                    tgt_emb = self.embedding(seq) * (self.d_model ** 0.5)
+                    tgt_emb = tgt_emb + self.pos_encoder(tgt_pos)
+                    
+                    out = self.decoder(
+                        tgt_emb,
+                        memory[batch_idx:batch_idx+1],
+                        tgt_mask=tgt_mask,
+                        memory_key_padding_mask=~src_mask[batch_idx:batch_idx+1]
                     )
                     
-                    # Get encoder output for discriminator
-                    encoder_output = outputs['encoder_output']
+                    logits = self.output_layer(out[:, -1, :]) / temperature
+                    log_probs = torch.log_softmax(logits, dim=-1)
                     
-                    # Train discriminator on real data
-                    vuln_pred, synth_pred = self.discriminator(encoder_output.detach())
-                    vuln_loss_real = self.bce_loss(vuln_pred, is_vulnerable)
+                    # Get top-k candidates
+                    top_k_log_probs, top_k_indices = torch.topk(log_probs, beam_size, dim=-1)
                     
-                    # For synthetic detection, randomly choose between input_ids and decoder output
-                    if torch.rand(1) < 0.5:
-                        synth_loss_real = self.bce_loss(synth_pred, torch.zeros_like(synth_pred))
-                        is_synthetic = torch.zeros_like(synth_pred)
-                    else:
-                        synth_loss_real = self.bce_loss(synth_pred, torch.ones_like(synth_pred))
-                        is_synthetic = torch.ones_like(synth_pred)
-                    
-                    # Generate synthetic data
-                    with torch.no_grad():
-                        synthetic_outputs = self.model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            path_input_ids=path_input_ids,
-                            path_attention_mask=path_attention_mask,
-                            target_ids=None
-                        )
-                        synthetic_encoder_output = synthetic_outputs['encoder_output']
-                    
-                    # Train discriminator on synthetic data
-                    vuln_pred_synth, synth_pred_synth = self.discriminator(synthetic_encoder_output)
-                    vuln_loss_synth = self.bce_loss(vuln_pred_synth, torch.zeros_like(vuln_pred_synth))
-                    synth_loss_synth = self.bce_loss(synth_pred_synth, torch.ones_like(synth_pred_synth))
-                    
-                    # Combined discriminator loss
-                    d_loss = (vuln_loss_real + synth_loss_real + vuln_loss_synth + synth_loss_synth) / 2
-                    d_penalty = self.compute_penalty(d_loss, self.lambda_d, self.delta_d)
-                    d_loss = d_loss + d_penalty
+                    for k in range(beam_size):
+                        next_token = top_k_indices[0, k].unsqueeze(0).unsqueeze(0)
+                        next_log_prob = top_k_log_probs[0, k].item()
+                        new_seq = torch.cat([seq, next_token], dim=1)
+                        new_score = score + next_log_prob
+                        new_beams[batch_idx].append((new_seq, new_score))
                 
-                # Backward pass for discriminator with gradient scaling
-                self.scaler.scale(d_loss).backward()
-                self.scaler.step(self.discriminator_optimizer)
-                self.scaler.update()
-                
-                # Train generator
-                self.optimizer.zero_grad()
-                
-                with torch.cuda.amp.autocast():
-                    logits = outputs['logits']
-                    # Use the processed target_ids from the model output
-                    processed_target_ids = outputs['target_ids']
-
-                    if torch.isnan(logits).any() or torch.isinf(logits).any():
-                        print("Warning: NaN or Inf detected in logits")
-                        continue
-                        
-                    if torch.isnan(processed_target_ids).any() or torch.isinf(processed_target_ids).any():
-                        print("Warning: NaN or Inf detected in processed_target_ids")
-                        continue
-                    
-                    gen_loss = self.criterion(logits, processed_target_ids)
-
-                    if torch.isnan(gen_loss) or torch.isinf(gen_loss):
-                        print(f"Warning: Invalid gen_loss detected: {gen_loss.item()}")
-                        continue
-                    
-                    # Generate new synthetic data for generator training
-                    synthetic_outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        path_input_ids=path_input_ids,
-                        path_attention_mask=path_attention_mask,
-                        target_ids=None
-                    )
-                    synthetic_encoder_output = synthetic_outputs['encoder_output']
-                    
-                    # Adversarial loss for generator
-                    vuln_pred, synth_pred = self.discriminator(synthetic_encoder_output)
-                    
-                    # Generator losses
-                    adv_vuln_loss = self.bce_loss(vuln_pred, torch.zeros_like(vuln_pred))
-                    adv_synth_loss = self.bce_loss(synth_pred, torch.zeros_like(synth_pred))
-                    diversity_loss = -torch.mean(torch.abs(synthetic_encoder_output - encoder_output.detach()))
-                    
-                    # Old loss function:
-                    #total_loss = gen_loss + 0.1 * (adv_vuln_loss + adv_synth_loss) + 0.05 * diversity_loss
-
-                    g_loss = gen_loss + 0.1 * (adv_vuln_loss + adv_synth_loss) + 0.05 * diversity_loss
-                    g_penalty = self.compute_penalty(g_loss, self.lambda_g, self.delta_g)
-                    total_loss = g_loss + g_penalty
-                    
-                    # Update progress bar with penalty information
-                    progress_bar.set_postfix({
-                        'gen_loss': gen_loss.item(),
-                        'vuln_loss': (vuln_loss_real.item() + vuln_loss_synth.item()) / 2,
-                        'synth_loss': (synth_loss_real.item() + synth_loss_synth.item()) / 2,
-                        'diversity_loss': diversity_loss.item(),
-                        'd_penalty': d_penalty.item(),
-                        'g_penalty': g_penalty.item(),
-                        'is_synthetic': is_synthetic.mean().item()
-                    })
- 
-                
-                # Backward pass for generator with gradient scaling
-                self.scaler.scale(total_loss).backward()
-                
-                # Gradient clipping
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                
-                # Update weights
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                
-                # Update metrics
-                total_loss += gen_loss.item()
-                total_vuln_loss += (vuln_loss_real.item() + vuln_loss_synth.item()) / 2
-                total_synth_loss += (synth_loss_real.item() + synth_loss_synth.item()) / 2
-                batch_count += 1
-                
-                # Clear some memory
-                del outputs, synthetic_outputs, encoder_output, synthetic_encoder_output
-                torch.cuda.empty_cache()
-                
-            except Exception as e:
-                print(f"Error in batch: {str(e)}")
-                print(f"Batch keys: {batch.keys()}")
-                print(f"Label shape: {batch['label'].shape if 'label' in batch else 'No label'}")
-                print(f"Label type: {batch['label'].dtype if 'label' in batch else 'No label'}")
-                print(f"Vuln pred shape: {vuln_pred.shape if 'vuln_pred' in locals() else 'Not created'}")
-                print(f"Synth pred shape: {synth_pred.shape if 'synth_pred' in locals() else 'Not created'}")
-                print(f"GPU Memory: {torch.cuda.memory_allocated(self.device) / 1024**2:.2f}MB allocated")
-                print(f"GPU Memory: {torch.cuda.memory_reserved(self.device) / 1024**2:.2f}MB reserved")
-                continue
+                # Keep only top beam_size candidates
+                new_beams[batch_idx].sort(key=lambda x: x[1], reverse=True)
+                new_beams[batch_idx] = new_beams[batch_idx][:beam_size]
+            
+            beams = new_beams
+        
+        # Return best sequence for each batch
+        best_sequences = []
+        for batch_idx in range(batch_size):
+            best_seq, _ = max(beams[batch_idx], key=lambda x: x[1])
+            best_sequences.append(best_seq[0])
+        
+        # Stack sequences (pad if necessary)
+        max_seq_len = max(seq.size(0) for seq in best_sequences)
+        padded_sequences = []
+        for seq in best_sequences:
+            if seq.size(0) < max_seq_len:
+                padding = torch.zeros((max_seq_len - seq.size(0),), dtype=torch.long, device=device)
+                seq = torch.cat([seq, padding])
+            padded_sequences.append(seq)
+        
+        result = torch.stack(padded_sequences)
+        encoder_output = torch.mean(memory, dim=1)
         
         return {
-            'gen_loss': total_loss / batch_count if batch_count > 0 else float('inf'),
-            'vuln_loss': total_vuln_loss / batch_count if batch_count > 0 else float('inf'),
-            'synth_loss': total_synth_loss / batch_count if batch_count > 0 else float('inf')
-        }
-    
-    def validate(self):
-        self.model.eval()
-        self.discriminator.eval()
-        total_loss = 0
-        total_vuln_loss = 0
-        total_synth_loss = 0
-        batch_count = 0
-        
-        device = torch.device(f"cuda:{self.gpu_id}")
-        
-        with torch.no_grad():
-            for batch in self.val_dataloader:
-                try:
-                    # Get batch data and move to GPU
-                    input_ids = batch['input_ids'].to(device)
-                    attention_mask = batch['attention_mask'].to(device)
-                    path_input_ids = batch['path_input_ids'].to(device)
-                    path_attention_mask = batch['path_attention_mask'].to(device)
-                    target_ids = batch['target_ids'].to(device)
-                    
-                    # Convert label to vulnerability indicator and reshape
-                    is_vulnerable = batch['label'].float().to(device).view(-1, 1)
-                    
-                    # Forward pass
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        path_input_ids=path_input_ids,
-                        path_attention_mask=path_attention_mask,
-                        target_ids=target_ids
-                    )
-                    
-                    # Calculate generator loss
-                    logits = outputs['logits']
-                    # Use the processed target_ids from the model output
-                    processed_target_ids = outputs['target_ids']
-                    gen_loss = self.criterion(logits, processed_target_ids)
-                    
-                    # Discriminator predictions
-                    vuln_pred, synth_pred = self.discriminator(outputs['encoder_output'])
-                    vuln_loss = self.bce_loss(vuln_pred, is_vulnerable)
-                    
-                    # For synthetic detection, use a mix of real and synthetic data
-                    synth_target = torch.zeros_like(synth_pred)
-                    synth_loss = self.bce_loss(synth_pred, synth_target)
-                    
-                    # Update metrics
-                    total_loss += gen_loss.item()
-                    total_vuln_loss += vuln_loss.item()
-                    total_synth_loss += synth_loss.item()
-                    batch_count += 1
-                    
-                except Exception as e:
-                    print(f"Error in validation batch: {str(e)}")
-                    print(f"Batch keys: {batch.keys()}")
-                    print(f"Label shape: {batch['label'].shape if 'label' in batch else 'No label'}")
-                    print(f"Label type: {batch['label'].dtype if 'label' in batch else 'No label'}")
-                    print(f"GPU Memory: {torch.cuda.memory_allocated(device) / 1024**2:.2f}MB allocated")
-                    print(f"GPU Memory: {torch.cuda.memory_reserved(device) / 1024**2:.2f}MB reserved")
-                    continue
-        
-        return {
-            'gen_loss': total_loss / batch_count if batch_count > 0 else float('inf'),
-            'vuln_loss': total_vuln_loss / batch_count if batch_count > 0 else float('inf'),
-            'synth_loss': total_synth_loss / batch_count if batch_count > 0 else float('inf')
-        }
-    
-    def train(self, num_epochs, checkpoint_dir='checkpoints'):
-        # Create checkpoint directory
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        for epoch in range(num_epochs):
-            print(f"\nEpoch {epoch + 1}/{num_epochs}")
-            
-            # Training phase
-            train_metrics = self.train_epoch()
-            
-            # Validation phase
-            val_metrics = self.validate()
-            
-            # Update learning rate
-            self.scheduler.step(val_metrics['gen_loss'])
-            
-            # Update training history
-            self.training_history['train_loss'].append(train_metrics['gen_loss'])
-            self.training_history['val_loss'].append(val_metrics['gen_loss'])
-            self.training_history['learning_rate'].append(self.optimizer.param_groups[0]['lr'])
-            self.training_history['vulnerability_loss'].append(train_metrics['vuln_loss'])
-            self.training_history['synthetic_loss'].append(train_metrics['synth_loss'])
-            
-            # Print metrics
-            print(f"Train Loss: {train_metrics['gen_loss']:.4f}")
-            print(f"Val Loss: {val_metrics['gen_loss']:.4f}")
-            print(f"Vulnerability Loss: {train_metrics['vuln_loss']:.4f}")
-            print(f"Synthetic Loss: {train_metrics['synth_loss']:.4f}")
-            print(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
-            
-            # Save checkpoint if validation loss improved
-            if val_metrics['gen_loss'] < self.best_val_loss:
-                self.best_val_loss = val_metrics['gen_loss']
-                checkpoint_path = os.path.join(checkpoint_dir, f'best_model_epoch_{epoch + 1}.pt')
-                torch.save({
-                    'epoch': epoch + 1,
-                    'model_state_dict': self.model.state_dict(),
-                    'discriminator_state_dict': self.discriminator.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'discriminator_optimizer_state_dict': self.discriminator_optimizer.state_dict(),
-                    'val_loss': val_metrics['gen_loss'],
-                    'training_history': self.training_history
-                }, checkpoint_path)
-                print(f"Saved checkpoint to {checkpoint_path}")
-            
-            # Save latest checkpoint
-            latest_checkpoint_path = os.path.join(checkpoint_dir, 'latest_model.pt')
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': self.model.state_dict(),
-                'discriminator_state_dict': self.discriminator.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'discriminator_optimizer_state_dict': self.discriminator_optimizer.state_dict(),
-                'val_loss': val_metrics['gen_loss'],
-                'training_history': self.training_history
-            }, latest_checkpoint_path) 
+            'generated_sequence': result,
+            'encoder_output': encoder_output
+        } 
