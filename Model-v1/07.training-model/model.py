@@ -169,9 +169,9 @@ class SmartContractTransformer(nn.Module):
             max_len = min(self.max_length, 1024)  # Updated to match model's max_length
             
             # Improved generation parameters
-            temperature = 0.8  # Slightly lower temperature for more focused generation
-            top_k = 40  # Reduced top-k for more focused sampling
-            top_p = 0.9  # Nucleus sampling
+            temperature = 0.7  # Lower temperature for more focused generation
+            top_k = 50  # Increased top-k for better diversity
+            top_p = 0.95  # Higher nucleus sampling threshold
             
             for i in range(max_len - 1):
                 tgt_mask = self.generate_square_subsequent_mask(tgt.size(1)).to(device)
@@ -221,11 +221,11 @@ class SmartContractTransformer(nn.Module):
                 # Improved stopping conditions
                 if (next_token == 2).any() or (next_token == 0).any():
                     # Only stop if we've generated a reasonable amount of tokens
-                    if i > 30:  # Increased minimum length
+                    if i > 50:  # Increased minimum length
                         break
                 
                 # Emergency break for very short generations
-                if i > 10 and (next_token == 2).all():
+                if i > 20 and (next_token == 2).all():
                     break
             
             return {
