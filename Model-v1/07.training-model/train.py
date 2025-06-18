@@ -296,12 +296,13 @@ class SmartContractTrainer:
                 contract_vulnerabilities = batch['contract_vulnerabilities']
                 token_to_line = batch['token_to_line']
                 
-                # Forward pass
+                # Forward pass with target_ids for training
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     ast_input_ids=ast_input_ids,
                     ast_attention_mask=ast_attention_mask,
+                    target_ids=input_ids,  # Use input_ids as target for training
                     token_to_line=token_to_line
                 )
                 
@@ -322,28 +323,23 @@ class SmartContractTrainer:
                 )
                 
                 # Calculate generator loss with label smoothing
-                generated_seq = outputs['generated_sequence']
-                target_seq = input_ids[:, :generated_seq.size(1)]
-                
-                # Convert generated sequence to logits
-                gen_logits = F.one_hot(generated_seq, num_classes=self.model.vocab_size).float()
-                gen_logits = gen_logits.view(-1, self.model.vocab_size)
+                logits = outputs['logits']
+                target_ids = outputs['target_ids']
                 
                 # Apply label smoothing
                 smoothing = 0.1
-                gen_logits = gen_logits * (1 - smoothing) + smoothing / self.model.vocab_size
+                n_classes = logits.size(-1)
+                one_hot = torch.zeros_like(logits).scatter(1, target_ids.unsqueeze(1), 1)
+                smooth_one_hot = one_hot * (1 - smoothing) + (smoothing / n_classes)
                 
-                # Reshape target sequence
-                target_seq = target_seq.contiguous().view(-1)
-                
-                # Calculate generator loss with label smoothing
-                gen_loss = F.cross_entropy(gen_logits, target_seq)
+                # Calculate generator loss
+                gen_loss = -(smooth_one_hot * torch.log_softmax(logits, dim=1)).sum(dim=1).mean()
                 
                 # Combined loss with adjusted weights
                 total_loss = (
                     gen_loss + 
-                    0.3 * contract_vuln_loss +  # Reduced weight for contract-level detection
-                    0.2 * line_vuln_loss       # Reduced weight for line-level detection
+                    0.2 * contract_vuln_loss +  # Further reduced weight for contract-level detection
+                    0.1 * line_vuln_loss       # Further reduced weight for line-level detection
                 )
                 
                 # Backward pass with gradient clipping
