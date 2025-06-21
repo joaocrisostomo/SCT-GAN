@@ -2,6 +2,22 @@ import torch
 import torch.nn as nn
 from torch.nn import TransformerEncoder, TransformerDecoder, TransformerEncoderLayer, TransformerDecoderLayer
 from transformers import AutoModel, AutoTokenizer
+import math
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:x.size(0), :]
 
 class SmartContractTransformer(nn.Module):
     def __init__(
@@ -11,50 +27,61 @@ class SmartContractTransformer(nn.Module):
         num_encoder_layers=6,
         num_decoder_layers=6,
         dim_feedforward=2048,
-        dropout=0.1,
+        dropout=0.3,  # Increased dropout for aggressive regularization
         max_length=1024,  # Match your dataset's max_length
         vocab_size=50265,  # Match your tokenizer's vocab size
         num_vulnerability_types=8  # Number of vulnerability types
     ):
         super().__init__()
         
-        # Token embedding with layer normalization
+        # Token embedding with more aggressive dropout
         self.embedding = nn.Embedding(vocab_size, d_model)
+        self.embedding_dropout = nn.Dropout(dropout)
         self.embedding_norm = nn.LayerNorm(d_model)
-        self.pos_encoder = nn.Embedding(max_length, d_model)
         
-        # AST path embedding with layer normalization
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model, max_length)
+        
+        # AST path embedding with layer normalization and dropout
         self.ast_embedding = nn.Embedding(vocab_size, d_model)
+        self.ast_embedding_dropout = nn.Dropout(dropout)
         self.ast_embedding_norm = nn.LayerNorm(d_model)
         
-        # Transformer encoder with improved configuration
+        # Transformer encoder with improved configuration and more dropout
         encoder_layer = TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
-            activation='gelu'  # Using GELU activation for better performance
+            activation='gelu',  # Using GELU activation for better performance
+            norm_first=True  # Pre-norm for better training stability
         )
         self.encoder = TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
         
-        # Transformer decoder with improved configuration
+        # Transformer decoder with improved configuration and more dropout
         decoder_layer = TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
-            activation='gelu'
+            activation='gelu',
+            norm_first=True  # Pre-norm for better training stability
         )
         self.decoder = TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
         
-        # Output projection with layer normalization
+        # Output projection with layer normalization and dropout
         self.output_norm = nn.LayerNorm(d_model)
+        self.output_dropout = nn.Dropout(dropout)
         self.output_layer = nn.Linear(d_model, vocab_size)
         
-        # Contract-level vulnerability detection head
+        # Contract-level vulnerability detection head with more dropout
         self.contract_vulnerability_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(d_model, d_model // 2),
             nn.LayerNorm(d_model // 2),
             nn.GELU(),
@@ -62,8 +89,12 @@ class SmartContractTransformer(nn.Module):
             nn.Linear(d_model // 2, num_vulnerability_types)
         )
         
-        # Line-level vulnerability detection head
+        # Line-level vulnerability detection head with more dropout
         self.line_vulnerability_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(d_model, d_model // 2),
             nn.LayerNorm(d_model // 2),
             nn.GELU(),
@@ -71,7 +102,7 @@ class SmartContractTransformer(nn.Module):
             nn.Linear(d_model // 2, num_vulnerability_types)
         )
         
-        # AST path attention layer
+        # AST path attention layer with more dropout
         self.ast_attention = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=nhead,
@@ -79,13 +110,38 @@ class SmartContractTransformer(nn.Module):
             batch_first=True
         )
         
+        # Cross-attention between contract and AST with more dropout
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Feature fusion layer with more dropout
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, d_model)
+        )
+        
         self.d_model = d_model
         self.max_length = max_length
         self.vocab_size = vocab_size
         self.num_vulnerability_types = num_vulnerability_types
         
-        # Initialize weights
+        # Initialize weights with better initialization
         self._init_weights()
+        
+        # Register gradient clipping hook on fusion layer to prevent explosion
+        for param in self.feature_fusion.parameters():
+            param.register_hook(self.hook_fn)
         
     def _init_weights(self):
         """Initialize weights for better training stability"""
@@ -98,8 +154,26 @@ class SmartContractTransformer(nn.Module):
         # Initialize embeddings with smaller variance for stability
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.ast_embedding.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.pos_encoder.weight, mean=0.0, std=0.02)
-                
+        
+        # Initialize output layer with smaller weights
+        nn.init.normal_(self.output_layer.weight, mean=0.0, std=0.02)
+        nn.init.constant_(self.output_layer.bias, 0.0)
+        
+        # Initialize vulnerability heads with smaller weights
+        for module in self.contract_vulnerability_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                nn.init.constant_(module.bias, 0.0)
+        
+        for module in self.line_vulnerability_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                nn.init.constant_(module.bias, 0.0)
+        
+    def hook_fn(self, grad):
+        """Gradient clipping hook"""
+        return torch.clamp(grad, -1.0, 1.0)
+        
     def generate_square_subsequent_mask(self, sz):
         """Generate a square mask for the sequence"""
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
@@ -121,40 +195,47 @@ class SmartContractTransformer(nn.Module):
         batch_size = input_ids.size(0)
         seq_len = input_ids.size(1)
         
-        # Create position indices for contract tokens
-        contract_pos = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        
-        # Contract embeddings with normalization
-        contract_emb = self.embedding(input_ids) * (self.d_model ** 0.5)
+        # Contract embeddings with improved processing
+        contract_emb = self.embedding(input_ids) * math.sqrt(self.d_model)
+        contract_emb = self.embedding_dropout(contract_emb)
         contract_emb = self.embedding_norm(contract_emb)
-        contract_emb = contract_emb + self.pos_encoder(contract_pos)
+        contract_emb = self.pos_encoder(contract_emb.transpose(0, 1)).transpose(0, 1)
         
-        # AST path embeddings with normalization
-        ast_pos = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        ast_emb = self.ast_embedding(ast_input_ids) * (self.d_model ** 0.5)
+        # AST path embeddings with improved processing
+        ast_emb = self.ast_embedding(ast_input_ids) * math.sqrt(self.d_model)
+        ast_emb = self.ast_embedding_dropout(ast_emb)
         ast_emb = self.ast_embedding_norm(ast_emb)
-        ast_emb = ast_emb + self.pos_encoder(ast_pos)
-        
-        # Use contract embeddings as source
-        src_emb = contract_emb
+        ast_emb = self.pos_encoder(ast_emb.transpose(0, 1)).transpose(0, 1)
         
         # Create source mask and ensure it's boolean
         src_mask = attention_mask if attention_mask is not None else torch.ones((batch_size, seq_len), dtype=torch.bool, device=device)
         src_mask = src_mask.bool()  # Ensure boolean type
         
-        # Encode with improved attention
-        memory = self.encoder(src_emb, src_key_padding_mask=~src_mask)
+        # Encode contract with improved attention
+        memory = self.encoder(contract_emb, src_key_padding_mask=~src_mask)
         
-        # Apply AST path attention
+        # Apply AST path attention with residual connection - simplified
         if ast_attention_mask is not None:
-            ast_attention_mask = ast_attention_mask.bool()  # Ensure boolean type
+            ast_attention_mask = ast_attention_mask.bool()
             ast_attn_output, _ = self.ast_attention(
                 query=memory,
                 key=ast_emb,
                 value=ast_emb,
                 key_padding_mask=~ast_attention_mask
             )
-            memory = memory + ast_attn_output  # Residual connection
+            memory = memory + 0.1 * ast_attn_output  # Reduced residual weight
+        
+        # Apply cross-attention between contract and AST - simplified
+        if ast_attention_mask is not None:
+            cross_attn_output, _ = self.cross_attention(
+                query=memory,
+                key=ast_emb,
+                value=ast_emb,
+                key_padding_mask=~ast_attention_mask
+            )
+            # Simplified feature fusion with reduced complexity
+            fused_features = self.feature_fusion(torch.cat([memory, 0.1 * cross_attn_output], dim=-1))
+            memory = memory + 0.1 * fused_features  # Reduced residual weight
         
         # Get contract-level vulnerability predictions
         contract_representation = torch.mean(memory, dim=1)  # [batch_size, d_model]
@@ -175,11 +256,11 @@ class SmartContractTransformer(nn.Module):
             
             for i in range(max_len - 1):
                 tgt_mask = self.generate_square_subsequent_mask(tgt.size(1)).to(device)
-                tgt_pos = torch.arange(0, tgt.size(1), device=device).unsqueeze(0).expand(batch_size, -1)
                 
-                tgt_emb = self.embedding(tgt) * (self.d_model ** 0.5)
+                tgt_emb = self.embedding(tgt) * math.sqrt(self.d_model)
+                tgt_emb = self.embedding_dropout(tgt_emb)
                 tgt_emb = self.embedding_norm(tgt_emb)
-                tgt_emb = tgt_emb + self.pos_encoder(tgt_pos)
+                tgt_emb = self.pos_encoder(tgt_emb.transpose(0, 1)).transpose(0, 1)
                 
                 out = self.decoder(
                     tgt_emb,
@@ -188,8 +269,9 @@ class SmartContractTransformer(nn.Module):
                     memory_key_padding_mask=~src_mask
                 )
                 
-                # Apply layer normalization before output projection
+                # Apply layer normalization and dropout before output projection
                 out = self.output_norm(out)
+                out = self.output_dropout(out)
                 logits = self.output_layer(out[:, -1, :])
                 
                 # Apply temperature scaling
@@ -238,12 +320,12 @@ class SmartContractTransformer(nn.Module):
             # Training mode with improved handling
             target_ids_copy = target_ids.clone()
             
-            tgt_pos = torch.arange(0, target_ids_copy.size(1), device=device).unsqueeze(0).expand(batch_size, -1)
             tgt_mask = self.generate_square_subsequent_mask(target_ids_copy.size(1)).to(device)
             
-            tgt_emb = self.embedding(target_ids_copy) * (self.d_model ** 0.5)
+            tgt_emb = self.embedding(target_ids_copy) * math.sqrt(self.d_model)
+            tgt_emb = self.embedding_dropout(tgt_emb)
             tgt_emb = self.embedding_norm(tgt_emb)
-            tgt_emb = tgt_emb + self.pos_encoder(tgt_pos)
+            tgt_emb = self.pos_encoder(tgt_emb.transpose(0, 1)).transpose(0, 1)
             
             out = self.decoder(
                 tgt_emb,
@@ -252,8 +334,9 @@ class SmartContractTransformer(nn.Module):
                 memory_key_padding_mask=~src_mask
             )
             
-            # Apply layer normalization before output projection
+            # Apply layer normalization and dropout before output projection
             out = self.output_norm(out)
+            out = self.output_dropout(out)
             logits = self.output_layer(out)
             
             # Reshape logits and target_ids to match

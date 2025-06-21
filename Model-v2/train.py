@@ -8,7 +8,8 @@ import os
 import numpy as np
 from tqdm import tqdm
 from torch.nn import functional as F
-from transformers import get_cosine_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
+import math
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
@@ -203,9 +204,9 @@ class SmartContractTrainer:
         train_dataloader,
         val_dataloader,
         tokenizer,
-        learning_rate=0.0001,
-        weight_decay=0.01,
-        max_grad_norm=1.0,
+        learning_rate=1e-6,  # Ensure this is actually 1e-6, not 0.05
+        weight_decay=0.1,
+        max_grad_norm=1.0,   # Reduce back to 1.0 for proper clipping
         gpu_id=0,
         d_model=768
     ):
@@ -232,34 +233,38 @@ class SmartContractTrainer:
             else:
                 base_params.append(param)
         
-        # Initialize optimizer with separate parameter groups and lower learning rates
+        # Initialize optimizer with a single, stable learning rate.
         self.optimizer = optim.AdamW([
             {'params': base_params, 'lr': learning_rate},
             {'params': contract_head_params, 'lr': learning_rate * 1.5},
             {'params': line_head_params, 'lr': learning_rate * 1.5}
-        ], weight_decay=weight_decay)
+        ], weight_decay=weight_decay, betas=(0.9, 0.98), eps=1e-9)
         
-        # Learning rate scheduler with longer warmup and slower decay
-        num_training_steps = len(train_dataloader) * 400  # 400 epochs
-        num_warmup_steps = num_training_steps // 5  # 20% warmup
-        
-        self.scheduler = get_cosine_schedule_with_warmup(
+        # New Scheduler: Reduce learning rate when validation loss plateaus.
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps
+            mode='min',
+            factor=0.5,
+            patience=5,
+            verbose=True
         )
         
         self.max_grad_norm = max_grad_norm
         
-        # Initialize focal loss with adjusted parameters
+        # Use simpler loss functions for stability
         self.focal_loss = FocalLoss(
-            alpha=0.5,
-            gamma=1.5,
+            alpha=0.25,
+            gamma=2.0,
             reduction='mean'
         )
         
+        # Use PyTorch's built-in CrossEntropyLoss for stability
+        self.generator_loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
         # Training metrics
         self.best_val_loss = float('inf')
+        self.patience_counter = 0
+        self.patience = 10
         self.training_history = {
             'train_loss': [],
             'val_loss': [],
@@ -267,6 +272,13 @@ class SmartContractTrainer:
             'line_vuln_loss': [],
             'learning_rate': []
         }
+        
+        # Verify learning rate is set correctly
+        print(f"Initial learning rate: {self.optimizer.param_groups[0]['lr']}")
+        if self.optimizer.param_groups[0]['lr'] > 1e-3:
+            print("WARNING: Learning rate is too high! Setting to 1e-3")
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = 1e-3
 
     def train_epoch(self, epoch):
         self.model.train()
@@ -282,7 +294,7 @@ class SmartContractTrainer:
             bar_format='{l_bar}{bar:10}{r_bar}'
         )
         
-        for batch in self.train_dataloader:
+        for batch_idx, batch in enumerate(self.train_dataloader):
             try:
                 # Move tensors to device
                 batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
@@ -322,32 +334,44 @@ class SmartContractTrainer:
                     vulnerable_lines.view(-1, self.model.num_vulnerability_types).float()
                 )
                 
-                # Calculate generator loss with label smoothing
+                # Calculate generator loss
                 logits = outputs['logits']
                 target_ids = outputs['target_ids']
+                gen_loss = self.generator_loss_fn(logits, target_ids)
                 
-                # Apply label smoothing
-                smoothing = 0.1
-                n_classes = logits.size(-1)
-                one_hot = torch.zeros_like(logits).scatter(1, target_ids.unsqueeze(1), 1)
-                smooth_one_hot = one_hot * (1 - smoothing) + (smoothing / n_classes)
-                
-                # Calculate generator loss
-                gen_loss = -(smooth_one_hot * torch.log_softmax(logits, dim=1)).sum(dim=1).mean()
-                
-                # Combined loss with adjusted weights
+                # Combined loss with stable weights - simplified to reduce gradient conflicts
                 total_loss = (
-                    gen_loss + 
-                    0.2 * contract_vuln_loss +  # Further reduced weight for contract-level detection
-                    0.1 * line_vuln_loss       # Further reduced weight for line-level detection
+                    0.7 * gen_loss +  # Focus more on generation loss
+                    0.2 * contract_vuln_loss +
+                    0.1 * line_vuln_loss  # Reduce line-level loss weight
                 )
                 
                 # Backward pass with gradient clipping
                 self.optimizer.zero_grad()
                 total_loss.backward()
+                
+                # Apply gradient clipping BEFORE checking norms
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                
+                # Check for gradient explosion after clipping
+                total_norm = 0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** (1. / 2)
+                
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"NaN or Inf loss detected. Skipping update.")
+                    self.optimizer.zero_grad()
+                    continue
+
+                if total_norm > 1000: # Allow gradients up to 1000 as requested
+                    print(f"Extremely high gradient norm detected: {total_norm:.4f}. Skipping update.")
+                    self.optimizer.zero_grad()
+                    continue
+                
                 self.optimizer.step()
-                self.scheduler.step()
                 
                 # Update metrics
                 total_gen_loss += gen_loss.item()
@@ -361,11 +385,12 @@ class SmartContractTrainer:
                     'gen_loss': f'{gen_loss.item():.4f}',
                     'contract_vuln_loss': f'{contract_vuln_loss.item():.4f}',
                     'line_vuln_loss': f'{line_vuln_loss.item():.4f}',
-                    'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
+                    'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}',
+                    'grad_norm': f'{total_norm:.2f}'
                 })
                 
             except Exception as e:
-                print(f"\nError in batch: {str(e)}")
+                print(f"\nError in batch {batch_idx}: {str(e)}")
                 continue
         
         progress_bar.close()
@@ -405,6 +430,7 @@ class SmartContractTrainer:
                         attention_mask=attention_mask,
                         ast_input_ids=ast_input_ids,
                         ast_attention_mask=ast_attention_mask,
+                        target_ids=input_ids,
                         token_to_line=token_to_line
                     )
                     
@@ -425,20 +451,15 @@ class SmartContractTrainer:
                     )
                     
                     # Calculate generator loss
-                    generated_seq = outputs['generated_sequence']
-                    target_seq = input_ids[:, :generated_seq.size(1)]
-                    
-                    gen_logits = F.one_hot(generated_seq, num_classes=self.model.vocab_size).float()
-                    gen_logits = gen_logits.view(-1, self.model.vocab_size)
-                    target_seq = target_seq.contiguous().view(-1)
-                    
-                    gen_loss = F.cross_entropy(gen_logits, target_seq)
+                    logits = outputs['logits']
+                    target_ids = outputs['target_ids']
+                    gen_loss = self.generator_loss_fn(logits, target_ids)
                     
                     # Combined loss
                     total_loss = (
                         gen_loss + 
-                        0.5 * contract_vuln_loss +
-                        0.3 * line_vuln_loss
+                        0.3 * contract_vuln_loss +
+                        0.2 * line_vuln_loss
                     )
                     
                     total_gen_loss += gen_loss.item()
@@ -482,9 +503,13 @@ class SmartContractTrainer:
             print(f"Line Vulnerability Loss: {train_metrics['line_vuln_loss']:.4f}")
             print(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
             
+            # Step the scheduler with the validation loss
+            self.scheduler.step(val_metrics['gen_loss'])
+            
             # Save checkpoint if validation loss improved
             if val_metrics['gen_loss'] < self.best_val_loss:
                 self.best_val_loss = val_metrics['gen_loss']
+                self.patience_counter = 0
                 checkpoint_path = os.path.join(checkpoint_dir, f'best_model_epoch_{epoch + 1}.pt')
                 torch.save({
                     'epoch': epoch + 1,
@@ -495,6 +520,14 @@ class SmartContractTrainer:
                     'training_history': self.training_history
                 }, checkpoint_path)
                 print(f"🎉 New best validation loss! Saved checkpoint to {checkpoint_path}")
+            else:
+                self.patience_counter += 1
+                print(f"No improvement for {self.patience_counter} epochs")
+            
+            # Early stopping
+            if self.patience_counter >= self.patience:
+                print(f"Early stopping triggered after {self.patience} epochs without improvement")
+                break
             
             # Save latest checkpoint
             latest_checkpoint_path = os.path.join(checkpoint_dir, 'latest_model.pt')
@@ -505,4 +538,4 @@ class SmartContractTrainer:
                 'scheduler_state_dict': self.scheduler.state_dict(),
                 'val_loss': val_metrics['gen_loss'],
                 'training_history': self.training_history
-            }, latest_checkpoint_path) 
+            }, latest_checkpoint_path)
