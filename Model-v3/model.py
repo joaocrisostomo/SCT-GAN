@@ -30,7 +30,8 @@ class SmartContractTransformer(nn.Module):
         dropout=0.3,  # Increased dropout for aggressive regularization
         max_length=1024,  # Match your dataset's max_length
         vocab_size=50265,  # Match your tokenizer's vocab size
-        num_vulnerability_types=8  # Number of vulnerability types
+        num_vulnerability_types=8,  # Number of vulnerability types
+        use_gan=False  # Enable GAN training with integrated discriminator
     ):
         super().__init__()
         
@@ -89,9 +90,18 @@ class SmartContractTransformer(nn.Module):
             nn.Linear(d_model // 2, num_vulnerability_types)
         )
         
-        # Line-level vulnerability detection head with more dropout
+        # IMPROVED: Line-level vulnerability detection with spatial attention
+        # Spatial attention for capturing local context
+        self.spatial_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Line-level vulnerability detection head with spatial context
         self.line_vulnerability_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model * 2, d_model),  # *2 for spatial context
             nn.LayerNorm(d_model),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -131,6 +141,42 @@ class SmartContractTransformer(nn.Module):
             nn.Linear(d_model // 2, d_model)
         )
         
+        # GAN Discriminator components
+        self.use_gan = use_gan
+        if use_gan:
+            # Path-aware attention for discriminator
+            self.disc_path_attention = nn.MultiheadAttention(
+                embed_dim=d_model,
+                num_heads=nhead,
+                dropout=dropout,
+                batch_first=True
+            )
+            
+            # Grammar constraint for discriminator
+            self.disc_grammar_embedding = nn.Embedding(vocab_size, d_model)
+            self.disc_grammar_projection = nn.Linear(d_model, d_model)
+            
+            # Feature extraction for discriminator
+            self.disc_feature_extractor = nn.Sequential(
+                nn.Linear(d_model, d_model * 2),
+                nn.LayerNorm(d_model * 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model * 2, d_model),
+                nn.LayerNorm(d_model),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            )
+            
+            # Binary classification head for real vs fake detection
+            self.disc_synthetic_head = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.LayerNorm(d_model // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model // 2, 1)  # Single output for real/fake classification
+            )
+        
         self.d_model = d_model
         self.max_length = max_length
         self.vocab_size = vocab_size
@@ -169,6 +215,20 @@ class SmartContractTransformer(nn.Module):
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 nn.init.constant_(module.bias, 0.0)
+        
+        # Initialize discriminator components if GAN is enabled
+        if self.use_gan:
+            for module in self.disc_feature_extractor.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0.0)
+            
+            for module in self.disc_synthetic_head.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0.0)
         
     def hook_fn(self, grad):
         """Gradient clipping hook"""
@@ -241,8 +301,18 @@ class SmartContractTransformer(nn.Module):
         contract_representation = torch.mean(memory, dim=1)  # [batch_size, d_model]
         contract_vuln_logits = self.contract_vulnerability_head(contract_representation)  # [batch_size, num_vuln_types]
         
-        # Get line-level vulnerability predictions
-        line_vuln_logits = self.line_vulnerability_head(memory)  # [batch_size, seq_len, num_vuln_types]
+        # IMPROVED: Get line-level vulnerability predictions with spatial context
+        # Apply spatial attention to capture local context
+        spatial_context, _ = self.spatial_attention(
+            query=memory,
+            key=memory,
+            value=memory,
+            attn_mask=None  # Allow full attention for spatial context
+        )
+        
+        # Combine original features with spatial context
+        line_features = torch.cat([memory, spatial_context], dim=-1)  # [batch_size, seq_len, d_model*2]
+        line_vuln_logits = self.line_vulnerability_head(line_features)  # [batch_size, seq_len, num_vuln_types]
         
         if target_ids is None:
             # Generate sequence with improved logic
@@ -348,7 +418,9 @@ class SmartContractTransformer(nn.Module):
                 'logits': logits,
                 'target_ids': shifted_target_ids,
                 'contract_vulnerability_logits': contract_vuln_logits,
-                'line_vulnerability_logits': line_vuln_logits
+                'line_vulnerability_logits': line_vuln_logits,
+                'encoder_output': memory.mean(dim=1),  # [batch_size, d_model] for discriminator
+                'discriminator_logits': self.discriminator_forward(memory) if self.use_gan else None
             }
 
     def generate_with_beam_search(self, input_ids, attention_mask, path_input_ids, path_attention_mask, 
@@ -461,4 +533,33 @@ class SmartContractTransformer(nn.Module):
         return {
             'generated_sequence': result,
             'encoder_output': encoder_output
-        } 
+        }
+
+    def discriminator_forward(self, features):
+        """
+        Forward pass for the integrated discriminator
+        Args:
+            features: Input tensor of shape [batch_size, seq_len, d_model]
+        Returns:
+            synthetic_logits: Logits for real vs fake classification
+        """
+        if not self.use_gan:
+            return None
+        
+        # Apply path-aware attention
+        attn_output, _ = self.disc_path_attention(features, features, features)
+        x = features + attn_output
+        
+        # Apply grammar constraint
+        x = self.disc_grammar_projection(x)
+        
+        # Global average pooling to get fixed-size representation
+        x = x.mean(dim=1)  # [batch_size, d_model]
+        
+        # Extract features
+        features = self.disc_feature_extractor(x)
+        
+        # Binary classification: real (1) vs fake (0)
+        synthetic_logits = self.disc_synthetic_head(features)
+        
+        return synthetic_logits 

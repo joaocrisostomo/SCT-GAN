@@ -13,7 +13,8 @@ class SmartContractAnalyzer:
         self,
         model_path: str,
         tokenizer_name: str = "microsoft/codebert-base",
-        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        use_gan: bool = True
     ):
         """
         Initialize the SmartContractAnalyzer with a trained model.
@@ -22,9 +23,12 @@ class SmartContractAnalyzer:
             model_path: Path to the saved model checkpoint
             tokenizer_name: Name of the tokenizer to use
             device: Device to run the model on ('cuda' or 'cpu')
+            use_gan: Whether to enable GAN components
         """
         self.device = torch.device(device)
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         
         # Initialize model with same parameters as training
         self.model = SmartContractTransformer(
@@ -33,15 +37,26 @@ class SmartContractAnalyzer:
             num_encoder_layers=6,
             num_decoder_layers=6,
             dim_feedforward=2048,
-            dropout=0.3,
+            dropout=0.1,
             max_length=1024,
-            vocab_size=50265,
-            num_vulnerability_types=8
+            vocab_size=self.tokenizer.vocab_size,
+            num_vulnerability_types=8,
+            use_gan=use_gan  # Only use_gan is a model parameter
         )
         
         # Load the trained model
         checkpoint = torch.load(model_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        if 'model_state_dict' in checkpoint:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Model loaded from {model_path}")
+            print(f"Training epoch: {checkpoint.get('epoch', 'Unknown')}")
+            print(f"Best validation loss: {checkpoint.get('val_loss', 'Unknown')}")
+            print(f"Training config: GAN={checkpoint.get('use_gan', 'Unknown')}")
+        else:
+            # Direct state dict
+            self.model.load_state_dict(checkpoint)
+            print(f"Model loaded from {model_path}")
+        
         self.model.to(self.device)
         self.model.eval()
         
@@ -181,17 +196,43 @@ class SmartContractAnalyzer:
         
         # Get model predictions
         with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                ast_input_ids=ast_input_ids,
-                ast_attention_mask=ast_attention_mask,
-                token_to_line=token_to_line
-            )
+            try:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    ast_input_ids=ast_input_ids,
+                    ast_attention_mask=ast_attention_mask,
+                    target_ids=input_ids,  # Use input_ids as target for inference
+                    token_to_line=token_to_line
+                )
+            except Exception as e:
+                print(f"Error during model forward pass: {str(e)}")
+                # Try without target_ids for older model versions
+                try:
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        ast_input_ids=ast_input_ids,
+                        ast_attention_mask=ast_attention_mask,
+                        token_to_line=token_to_line
+                    )
+                except Exception as e2:
+                    print(f"Error with fallback forward pass: {str(e2)}")
+                    raise
             
             # Get contract-level and line-level vulnerability predictions
-            contract_vuln_logits = outputs['contract_vulnerability_logits']
-            line_vuln_logits = outputs['line_vulnerability_logits']
+            contract_vuln_logits = outputs.get('contract_vulnerability_logits')
+            line_vuln_logits = outputs.get('line_vulnerability_logits')
+            
+            if contract_vuln_logits is None or line_vuln_logits is None:
+                print("Warning: Vulnerability detection outputs not found in model")
+                # Return empty results
+                return {
+                    'contract_vulnerabilities': {vuln_type: False for vuln_type in self.vulnerability_types},
+                    'line_vulnerabilities': {},
+                    'contract_probabilities': [[0.0] * len(self.vulnerability_types)],
+                    'line_probabilities': []
+                }
             
             # Debug: Print shapes to understand the output
             print(f"Contract vuln logits shape: {contract_vuln_logits.shape}")
