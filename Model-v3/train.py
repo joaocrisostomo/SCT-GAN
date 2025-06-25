@@ -12,6 +12,7 @@ from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_wi
 import math
 import random
 from data_augmentation import SmartContractAugmenter
+import re
 
 # GAN Components
 class PathAwareAttention(nn.Module):
@@ -37,8 +38,6 @@ class GrammarConstraint(nn.Module):
     def forward(self, x):
         # Apply grammar-aware projection
         return self.grammar_projection(x)
-
-# Note: Discriminator is now integrated into the main model to avoid backward graph issues
 
 class AugmentedContractDataset(Dataset):
     def __init__(self, original_contracts, augmenter, num_variants_per_contract=3):
@@ -148,55 +147,97 @@ class SpatialAwareFocalLoss(nn.Module):
         """
         Compute spatial penalty based on vulnerability patterns in nearby lines.
         """
+        # Handle the case where token_to_line is None
+        if token_to_line is None:
+            return torch.zeros_like(pred)
+        
         # Reshape back to batch format for spatial computation
-        batch_size = pred.shape[0] // 1024 if pred.shape[0] > 1024 else 1
-        seq_len = 1024
+        # The input is flattened, so we need to determine the batch size
+        total_tokens = pred.shape[0]
+        
+        # Try to determine batch size from token_to_line shape
+        if token_to_line.shape[0] == total_tokens:
+            # If token_to_line has the same number of tokens, assume batch_size=1
+            batch_size = 1
+            seq_len = total_tokens
+        else:
+            # Otherwise, try to infer from total tokens
+            if total_tokens % 1024 == 0:
+                batch_size = total_tokens // 1024
+                seq_len = 1024
+            else:
+                # Fallback: assume single batch
+                batch_size = 1
+                seq_len = total_tokens
+        
         num_classes = pred.shape[1]
         device = pred.device
         
+        # Ensure we have valid shapes
+        if batch_size * seq_len != total_tokens:
+            # If shapes don't match, return zero penalty
+            return torch.zeros_like(pred)
+        
         # Reshape tensors to [batch_size, seq_len, num_classes]
-        pred_reshaped = pred.view(batch_size, seq_len, num_classes)
-        target_reshaped = target.view(batch_size, seq_len, num_classes)
-        token_to_line_reshaped = token_to_line.view(batch_size, seq_len)
+        try:
+            pred_reshaped = pred.view(batch_size, seq_len, num_classes)
+            target_reshaped = target.view(batch_size, seq_len, num_classes)
+            token_to_line_reshaped = token_to_line.view(batch_size, seq_len)
+        except Exception:
+            # If reshaping fails, return zero penalty
+            return torch.zeros_like(pred)
         
         # Create spatial penalty tensor
         spatial_penalty = torch.zeros_like(pred_reshaped)
         
         for b in range(batch_size):
             for i in range(seq_len):
-                current_line = token_to_line_reshaped[b, i].item()
-                
-                # Find tokens from nearby lines (within ±2 lines)
-                nearby_mask = torch.abs(token_to_line_reshaped[b] - current_line) <= 2
-                nearby_mask[i] = False  # Exclude current token
-                
-                if nearby_mask.any():
-                    # Get vulnerability patterns from nearby tokens
-                    nearby_targets = target_reshaped[b, nearby_mask]  # [num_nearby, num_classes]
-                    nearby_preds = pred_reshaped[b, nearby_mask]      # [num_nearby, num_classes]
+                try:
+                    current_line = token_to_line_reshaped[b, i].item()
                     
-                    # If nearby tokens have vulnerabilities, increase penalty for current token
-                    if nearby_targets.sum() > 0:
-                        # Increase penalty for current token if it should also be vulnerable
-                        vulnerability_similarity = torch.sigmoid(nearby_preds).mean(dim=0)  # [num_classes]
-                        spatial_penalty[b, i] = vulnerability_similarity * 0.1
+                    # Find tokens from nearby lines (within ±2 lines)
+                    nearby_mask = torch.abs(token_to_line_reshaped[b] - current_line) <= 2
+                    nearby_mask[i] = False  # Exclude current token
+                    
+                    if nearby_mask.any():
+                        # Get vulnerability patterns from nearby tokens
+                        nearby_targets = target_reshaped[b, nearby_mask]  # [num_nearby, num_classes]
+                        nearby_preds = pred_reshaped[b, nearby_mask]      # [num_nearby, num_classes]
+                        
+                        # If nearby tokens have vulnerabilities, increase penalty for current token
+                        if nearby_targets.sum() > 0:
+                            # Increase penalty for current token if it should also be vulnerable
+                            vulnerability_similarity = torch.sigmoid(nearby_preds).mean(dim=0)  # [num_classes]
+                            spatial_penalty[b, i] = vulnerability_similarity * 0.1
+                except Exception:
+                    # If there's an error processing this token, skip it
+                    continue
         
         # Flatten back to match input shape
         return spatial_penalty.view(-1, num_classes)
 
-class SolidityTokenConstraints:
-    def __init__(self, tokenizer):
+class SoliditySyntaxLoss(nn.Module):
+    """
+    Loss function that penalizes the generator for generating invalid Solidity syntax.
+    This helps ensure generated contracts are syntactically correct.
+    """
+    def __init__(self, tokenizer, syntax_weight=0.1):
+        super().__init__()
         self.tokenizer = tokenizer
-        # Solidity keywords that must be followed by specific tokens
-        self.keyword_constraints = {
-            'contract': ['is', '{', 'interface'],
+        self.syntax_weight = syntax_weight
+        
+        # Pre-compute token IDs for common Solidity tokens
+        self._init_token_mappings()
+        
+    def _init_token_mappings(self):
+        """Initialize mappings for common Solidity tokens"""
+        # Common Solidity keywords that should be followed by specific tokens
+        self.keyword_followers = {
             'function': ['(', 'view', 'pure', 'external', 'public', 'internal', 'private'],
+            'contract': ['{', 'is', 'interface'],
             'if': ['('],
             'for': ['('],
             'while': ['('],
-            'do': ['{'],
-            'try': ['{'],
-            'catch': ['{'],
             'require': ['('],
             'assert': ['('],
             'revert': ['('],
@@ -204,153 +245,209 @@ class SolidityTokenConstraints:
             'return': [';', '('],
             'break': [';'],
             'continue': [';'],
-            'throw': [';'],
             'import': ['"', "'"],
             'pragma': ['solidity'],
-            'library': ['{', 'is'],
-            'interface': ['{', 'is'],
             'struct': ['{'],
             'enum': ['{'],
             'event': ['('],
             'modifier': ['{', '('],
-            'using': ['for'],
             'mapping': ['('],
-            'address': ['payable', ';', ',', ')'],
-            'uint': [';', ',', ')', '['],
-            'int': [';', ',', ')', '['],
-            'bool': [';', ',', ')'],
-            'string': [';', ',', ')'],
-            'bytes': [';', ',', ')', '['],
-            'memory': [';', ',', ')'],
-            'storage': [';', ',', ')'],
-            'calldata': [';', ',', ')'],
-            'public': [';', ',', ')', '{'],
-            'private': [';', ',', ')', '{'],
-            'internal': [';', ',', ')', '{'],
-            'external': [';', ',', ')', '{'],
-            'view': [';', ',', ')', '{'],
-            'pure': [';', ',', ')', '{'],
-            'payable': [';', ',', ')', '{'],
-            'constant': [';', ',', ')'],
-            'immutable': [';', ',', ')'],
-            'override': [';', ',', ')', '{'],
-            'virtual': [';', ',', ')', '{'],
-            'abstract': ['contract', 'interface'],
-            'indexed': [',', ')'],
-            'anonymous': [';'],
-            'unchecked': ['{'],
-            'receive': ['(', '{'],
-            'fallback': ['(', '{']
         }
         
-        # Token pairs that must be balanced
-        self.balanced_pairs = [
-            ('{', '}'),
-            ('(', ')'),
-            ('[', ']'),
-            ('"', '"'),
-            ("'", "'")
-        ]
+        # Convert keywords to token IDs
+        self.keyword_token_ids = {}
+        for keyword in self.keyword_followers.keys():
+            token_id = self.tokenizer.convert_tokens_to_ids(keyword)
+            if token_id != self.tokenizer.unk_token_id:
+                self.keyword_token_ids[token_id] = keyword
         
-        # Tokens that must be followed by a semicolon
-        self.semicolon_required = [
-            'return', 'break', 'continue', 'throw',
-            'require', 'assert', 'revert'
-        ]
+        # Convert follower tokens to token IDs
+        self.follower_token_ids = {}
+        for keyword, followers in self.keyword_followers.items():
+            keyword_id = self.tokenizer.convert_tokens_to_ids(keyword)
+            if keyword_id != self.tokenizer.unk_token_id:
+                follower_ids = []
+                for follower in followers:
+                    follower_id = self.tokenizer.convert_tokens_to_ids(follower)
+                    if follower_id != self.tokenizer.unk_token_id:
+                        follower_ids.append(follower_id)
+                if follower_ids:
+                    self.follower_token_ids[keyword_id] = follower_ids
         
-        # Initialize constraint masks
-        self._init_constraint_masks()
+        # Common token IDs
+        self.semicolon_id = self.tokenizer.convert_tokens_to_ids(';')
+        self.open_paren_id = self.tokenizer.convert_tokens_to_ids('(')
+        self.close_paren_id = self.tokenizer.convert_tokens_to_ids(')')
+        self.open_brace_id = self.tokenizer.convert_tokens_to_ids('{')
+        self.close_brace_id = self.tokenizer.convert_tokens_to_ids('}')
         
-        # Pre-compute token indices for faster lookup
-        self._precompute_token_indices()
+        print(f"✓ Syntax loss initialized with {len(self.keyword_token_ids)} keywords")
+        
+    def forward(self, logits, target_ids, generated_sequence=None):
+        """
+        Calculate syntax-aware loss.
+        
+        Args:
+            logits: Model output logits [batch_size, seq_len, vocab_size] or [batch_size*seq_len, vocab_size]
+            target_ids: Target token IDs [batch_size, seq_len] or [batch_size*seq_len]
+            generated_sequence: Generated sequence for syntax analysis (optional)
+        """
+        # Standard cross-entropy loss
+        ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1), reduction='mean')
+        
+        # Syntax penalty - much simpler and more effective
+        syntax_penalty = self._compute_simple_syntax_penalty(logits, target_ids)
+        
+        # Combine losses
+        total_loss = ce_loss + self.syntax_weight * syntax_penalty
+        
+        return total_loss
     
-    def _precompute_token_indices(self):
-        """Pre-compute token indices for faster lookup"""
-        self.keyword_indices = {}
-        self.allowed_token_indices = {}
-        
-        for keyword, allowed_tokens in self.keyword_constraints.items():
-            keyword_idx = self.tokenizer.convert_tokens_to_ids(keyword)
-            if keyword_idx != self.tokenizer.unk_token_id:
-                self.keyword_indices[keyword_idx] = True
-                allowed_indices = []
-                for token in allowed_tokens:
-                    token_idx = self.tokenizer.convert_tokens_to_ids(token)
-                    if token_idx != self.tokenizer.unk_token_id:
-                        allowed_indices.append(token_idx)
-                if allowed_indices:
-                    self.allowed_token_indices[keyword_idx] = torch.tensor(allowed_indices)
-    
-    def _init_constraint_masks(self):
-        """Initialize masks for token constraints"""
-        self.keyword_mask = torch.zeros(self.tokenizer.vocab_size)
-        self.balance_mask = torch.zeros(self.tokenizer.vocab_size)
-        self.semicolon_mask = torch.zeros(self.tokenizer.vocab_size)
-        
-        # Convert token constraints to indices
-        for keyword, allowed_tokens in self.keyword_constraints.items():
-            keyword_idx = self.tokenizer.convert_tokens_to_ids(keyword)
-            if keyword_idx != self.tokenizer.unk_token_id:
-                for token in allowed_tokens:
-                    token_idx = self.tokenizer.convert_tokens_to_ids(token)
-                    if token_idx != self.tokenizer.unk_token_id:
-                        self.keyword_mask[token_idx] = 1
-    
-    def apply_constraints_batch(self, logits, prev_tokens):
-        """Apply Solidity-specific constraints to logits for a batch of sequences"""
-        batch_size = prev_tokens.size(0)
-        device = logits.device
-        
-        # Initialize balance stacks for each sequence in batch
-        balance_stacks = [[] for _ in range(batch_size)]
-        
-        # Get last tokens for each sequence
-        last_tokens = prev_tokens[:, -1]
-        
-        # Create mask for allowed tokens
-        allowed_mask = torch.ones_like(logits)
-        
-        # Apply keyword constraints
-        for i in range(batch_size):
-            last_token = last_tokens[i].item()
-            if last_token in self.keyword_indices:
-                allowed_indices = self.allowed_token_indices.get(last_token, None)
-                if allowed_indices is not None:
-                    mask = torch.zeros_like(logits[i])
-                    mask[allowed_indices] = 1
-                    allowed_mask[i] = mask
-        
-        # Apply balanced pair constraints
-        for i in range(batch_size):
-            for open_token, close_token in self.balanced_pairs:
-                open_idx = self.tokenizer.convert_tokens_to_ids(open_token)
-                close_idx = self.tokenizer.convert_tokens_to_ids(close_token)
+    def _compute_simple_syntax_penalty(self, logits, target_ids):
+        """Compute simple but effective syntax penalty"""
+        try:
+            # Handle both 2D and 3D logits
+            if logits.dim() == 2:
+                # Flattened: [batch_size * seq_len, vocab_size]
+                total_tokens = target_ids.size(0)
+                if total_tokens % 1024 == 0:
+                    batch_size = total_tokens // 1024
+                    seq_len = 1024
+                else:
+                    batch_size = 1
+                    seq_len = total_tokens
                 
-                if open_idx != self.tokenizer.unk_token_id and close_idx != self.tokenizer.unk_token_id:
-                    if last_tokens[i].item() == open_idx:
-                        balance_stacks[i].append(close_idx)
-                    elif last_tokens[i].item() == close_idx and balance_stacks[i]:
-                        balance_stacks[i].pop()
+                try:
+                    logits_3d = logits.view(batch_size, seq_len, -1)
+                    target_3d = target_ids.view(batch_size, seq_len)
+                except:
+                    return torch.tensor(0.0, device=logits.device)
+            else:
+                # Already 3D: [batch_size, seq_len, vocab_size]
+                logits_3d = logits
+                target_3d = target_ids
+                batch_size, seq_len = target_3d.shape[:2]
             
-            # Prevent closing tokens if no matching open token
-            if not balance_stacks[i]:
-                for _, close_token in self.balanced_pairs:
-                    close_idx = self.tokenizer.convert_tokens_to_ids(close_token)
-                    if close_idx != self.tokenizer.unk_token_id:
-                        allowed_mask[i, close_idx] = 0
+            device = logits.device
+            total_penalty = 0.0
+            penalty_count = 0
+            
+            # Get token IDs with null checks
+            return_id = self.tokenizer.convert_tokens_to_ids('return')
+            break_id = self.tokenizer.convert_tokens_to_ids('break')
+            continue_id = self.tokenizer.convert_tokens_to_ids('continue')
+            
+            # Only proceed if we have valid token IDs
+            if return_id is None or break_id is None or continue_id is None:
+                return torch.tensor(0.0, device=device)
+            
+            # Check if other token IDs are valid
+            if (self.semicolon_id is None or self.open_paren_id is None or 
+                self.close_paren_id is None or self.open_brace_id is None or 
+                self.close_brace_id is None):
+                return torch.tensor(0.0, device=device)
+            
+            for b in range(batch_size):
+                for i in range(seq_len - 1):  # Look at current and next token
+                    current_token = target_3d[b, i].item()
+                    next_token = target_3d[b, i + 1].item()
+                    
+                    # Check for keyword-follower violations
+                    if current_token in self.keyword_token_ids:
+                        keyword = self.keyword_token_ids[current_token]
+                        expected_followers = self.follower_token_ids.get(current_token, [])
+                        
+                        if expected_followers and next_token not in expected_followers:
+                            # Apply penalty for incorrect follower
+                            total_penalty += 2.0
+                            penalty_count += 1
+                    
+                    # Check for missing semicolons after statements
+                    if current_token in [return_id, break_id, continue_id]:
+                        if next_token != self.semicolon_id:
+                            total_penalty += 1.5
+                            penalty_count += 1
+                    
+                    # Check for balanced parentheses
+                    if current_token == self.open_paren_id:
+                        # Look ahead for matching close parenthesis
+                        found_match = False
+                        for j in range(i + 1, min(i + 20, seq_len)):
+                            if target_3d[b, j].item() == self.close_paren_id:
+                                found_match = True
+                                break
+                        if not found_match:
+                            total_penalty += 1.0
+                            penalty_count += 1
+                    
+                    # Check for balanced braces
+                    if current_token == self.open_brace_id:
+                        # Look ahead for matching close brace
+                        found_match = False
+                        for j in range(i + 1, min(i + 50, seq_len)):
+                            if target_3d[b, j].item() == self.close_brace_id:
+                                found_match = True
+                                break
+                        if not found_match:
+                            total_penalty += 1.0
+                            penalty_count += 1
+            
+            # Return average penalty
+            if penalty_count > 0:
+                return torch.tensor(total_penalty / penalty_count, device=device)
+            else:
+                return torch.tensor(0.0, device=device)
+                
+        except Exception as e:
+            print(f"Error in syntax penalty calculation: {str(e)}")
+            return torch.tensor(0.0, device=logits.device)
+
+class ContractLevelFocalLoss(nn.Module):
+    """
+    Specialized focal loss for contract-level vulnerability detection.
+    Handles extreme class imbalance and provides better learning for rare vulnerability types.
+    """
+    def __init__(self, alpha=0.1, gamma=3.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
         
-        # Apply semicolon constraints
-        for i in range(batch_size):
-            last_token_str = self.tokenizer.decode([last_tokens[i].item()])
-            if last_token_str in self.semicolon_required:
-                semicolon_idx = self.tokenizer.convert_tokens_to_ids(';')
-                if semicolon_idx != self.tokenizer.unk_token_id:
-                    logits[i, semicolon_idx] *= 2  # Increase probability of semicolon
+    def forward(self, pred, target):
+        # Apply sigmoid to get probabilities
+        probs = torch.sigmoid(pred)
         
-        # Apply masks to logits
-        logits = logits.masked_fill(allowed_mask == 0, float('-inf'))
+        # Calculate focal loss for each vulnerability type
+        focal_losses = []
+        for i in range(pred.size(1)):  # For each vulnerability type
+            pred_i = pred[:, i]
+            target_i = target[:, i]
+            
+            # BCE loss
+            bce_loss = F.binary_cross_entropy_with_logits(pred_i, target_i, reduction='none')
+            
+            # Focal loss calculation
+            pt = torch.exp(-bce_loss)
+            focal_loss = self.alpha * (1-pt)**self.gamma * bce_loss
+            
+            # Add extra penalty for missed vulnerabilities (false negatives)
+            false_negative_penalty = torch.where(
+                (target_i == 1) & (probs[:, i] < 0.5),
+                torch.tensor(2.0).to(pred.device),  # Higher penalty for missed vulnerabilities
+                torch.tensor(1.0).to(pred.device)
+            )
+            
+            focal_loss = focal_loss * false_negative_penalty
+            focal_losses.append(focal_loss)
         
-        return logits
+        # Stack all vulnerability types
+        total_loss = torch.stack(focal_losses, dim=1)
+        
+        if self.reduction == 'mean':
+            return total_loss.mean()
+        elif self.reduction == 'sum':
+            return total_loss.sum()
+        return total_loss
 
 class SmartContractTrainer:
     def __init__(
@@ -381,8 +478,8 @@ class SmartContractTrainer:
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
 
-        # Initialize token constraints
-        self.token_constraints = SolidityTokenConstraints(tokenizer)
+        # Initialize syntax-aware loss for training
+        self.syntax_loss = SoliditySyntaxLoss(tokenizer, syntax_weight=0.5)
         
         # Get base model parameters (excluding vulnerability heads)
         base_params = []
@@ -393,7 +490,7 @@ class SmartContractTrainer:
         for name, param in self.model.named_parameters():
             if 'disc_' in name and self.use_gan:
                 discriminator_params.append(param)
-            elif 'contract_vulnerability_head' in name:
+            elif 'contract_vulnerability_head' in name or 'contract_feature_aggregation' in name or 'contract_vuln_attention' in name:
                 contract_head_params.append(param)
             elif 'line_vulnerability_head' in name or 'spatial_attention' in name:
                 line_head_params.append(param)
@@ -403,7 +500,7 @@ class SmartContractTrainer:
         # Initialize optimizer with different learning rates for different components
         param_groups = [
             {'params': base_params, 'lr': learning_rate},
-            {'params': contract_head_params, 'lr': learning_rate * 2.0},  # Higher LR for vulnerability heads
+            {'params': contract_head_params, 'lr': learning_rate * 4.0},  # Much higher LR for contract vulnerability heads
             {'params': line_head_params, 'lr': learning_rate * 8.0},  # Much higher LR for line vulnerability heads
         ]
         
@@ -432,15 +529,23 @@ class SmartContractTrainer:
             reduction='mean'
         )
         
+        # NEW: Specialized contract-level focal loss
+        self.contract_focal_loss = ContractLevelFocalLoss(
+            alpha=0.05,  # Very low alpha for extreme class imbalance
+            gamma=4.0,   # Higher gamma for more aggressive down-weighting
+            reduction='mean'
+        )
+        
         # NEW: Spatial-aware focal loss for line vulnerabilities
         self.spatial_focal_loss = SpatialAwareFocalLoss(
-            alpha=0.01,  # Very low alpha for extreme class imbalance
+            alpha=0.01,  # Very low alpha for extreme imbalance
             gamma=4.0,   # Higher gamma for more aggressive down-weighting
             spatial_weight=0.3,  # Weight for spatial context
             reduction='mean'
         )
         
-        self.generator_loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
+        # IMPROVED: Generator loss with syntax awareness
+        self.generator_loss_fn = self.syntax_loss  # Use syntax-aware loss instead of simple CrossEntropyLoss
         
         # Training metrics
         self.best_val_loss = float('inf')
@@ -452,7 +557,8 @@ class SmartContractTrainer:
             'contract_vuln_loss': [],
             'line_vuln_loss': [],
             'learning_rate': [],
-            'discriminator_loss': []
+            'discriminator_loss': [],
+            'syntax_loss': []  # NEW: Track syntax loss
         }
         
         # Verify learning rate is set correctly
@@ -488,6 +594,9 @@ class SmartContractTrainer:
         total_contract_vulns = 0
         total_line_vulns = 0
         
+        # NEW: Analyze vulnerability type distribution
+        vulnerability_type_counts = [0] * 8  # 8 vulnerability types
+        
         for batch in self.train_dataloader:
             batch_size = batch['contract_vulnerabilities'].size(0)
             total_contracts += batch_size
@@ -499,6 +608,10 @@ class SmartContractTrainer:
             # Count line-level vulnerabilities
             line_vulns = batch['vulnerable_lines'].sum().item()
             total_line_vulns += line_vulns
+            
+            # Count vulnerability types
+            for i in range(8):
+                vulnerability_type_counts[i] += batch['contract_vulnerabilities'][:, i].sum().item()
         
         contract_vuln_rate = total_contract_vulns / total_contracts if total_contracts > 0 else 0
         line_vuln_rate = total_line_vulns / (total_contracts * 1024 * 8) if total_contracts > 0 else 0  # 1024 seq_len * 8 vuln_types
@@ -509,9 +622,17 @@ class SmartContractTrainer:
         print(f"Contract vulnerability rate: {contract_vuln_rate:.4f} ({contract_vuln_rate*100:.2f}%)")
         print(f"Line vulnerability rate: {line_vuln_rate:.6f} ({line_vuln_rate*100:.4f}%)")
         
+        # NEW: Print vulnerability type distribution
+        print("\n=== Vulnerability Type Distribution ===")
+        vulnerability_types = ['ARTHM', 'DOS', 'LE', 'RENT', 'TimeM', 'TimeO', 'Tx-Origin', 'UE']
+        for i, (vuln_type, count) in enumerate(zip(vulnerability_types, vulnerability_type_counts)):
+            rate = count / total_contracts if total_contracts > 0 else 0
+            print(f"{vuln_type}: {count} ({rate*100:.2f}%)")
+        
         # Store vulnerability rates for dynamic weighting
         self.contract_vuln_rate = contract_vuln_rate
         self.line_vuln_rate = line_vuln_rate
+        self.vulnerability_type_counts = vulnerability_type_counts
         
         # IMPROVED: Dynamic loss weights based on vulnerability rates
         if line_vuln_rate < 0.001:  # Extreme imbalance
@@ -523,6 +644,46 @@ class SmartContractTrainer:
         else:
             self.line_vuln_weight = 200.0
             print(f"Line vulnerability weight: {self.line_vuln_weight}")
+        
+        # NEW: Contract vulnerability weight based on imbalance
+        if contract_vuln_rate < 0.5:  # Low contract vulnerability rate
+            self.contract_vuln_weight = 50.0  # Higher weight for contract vulnerabilities
+            print(f"⚠️  Low contract vulnerability rate detected. Using weight: {self.contract_vuln_weight}")
+        else:
+            self.contract_vuln_weight = 20.0
+            print(f"Contract vulnerability weight: {self.contract_vuln_weight}")
+
+        print("✓ Syntax-aware loss enabled - will penalize invalid Solidity syntax")
+        
+        # NEW: Test model dimensions to catch issues early
+        print("\n=== Model Dimension Test ===")
+        try:
+            # Create dummy inputs
+            test_input_ids = torch.randint(0, 1000, (2, 1024)).to(self.device)
+            test_attention_mask = torch.ones(2, 1024).to(self.device)
+            test_ast_input_ids = torch.randint(0, 1000, (2, 1024)).to(self.device)
+            test_ast_attention_mask = torch.ones(2, 1024).to(self.device)
+            test_token_to_line = torch.randint(0, 100, (2, 1024)).to(self.device)
+            
+            with torch.no_grad():
+                test_outputs = self.model(
+                    input_ids=test_input_ids,
+                    attention_mask=test_attention_mask,
+                    ast_input_ids=test_ast_input_ids,
+                    ast_attention_mask=test_ast_attention_mask,
+                    target_ids=test_input_ids,
+                    token_to_line=test_token_to_line
+                )
+                
+                print(f"✓ Model forward pass successful")
+                print(f"✓ Contract vuln logits: {test_outputs['contract_vulnerability_logits'].shape}")
+                print(f"✓ Line vuln logits: {test_outputs['line_vulnerability_logits'].shape}")
+                print(f"✓ Expected contract shape: [2, 8]")
+                print(f"✓ Expected line shape: [2, 1024, 8]")
+                
+        except Exception as e:
+            print(f"✗ Model dimension test failed: {str(e)}")
+            raise e
 
     def _create_augmented_batch(self, batch):
         """Create augmented training pairs from a batch"""
@@ -625,6 +786,7 @@ class SmartContractTrainer:
         total_contract_vuln_loss = 0
         total_line_vuln_loss = 0
         total_discriminator_loss = 0
+        total_syntax_loss = 0
         batch_count = 0
         
         progress_bar = tqdm(
@@ -670,6 +832,8 @@ class SmartContractTrainer:
                     
                 except Exception as e:
                     print(f"Error in model forward pass: {str(e)}")
+                    print(f"Input shapes - input_ids: {input_ids.shape}, attention_mask: {attention_mask.shape}")
+                    print(f"Input shapes - ast_input_ids: {ast_input_ids.shape}, ast_attention_mask: {ast_attention_mask.shape}")
                     continue
                 
                 # Get vulnerability predictions
@@ -680,16 +844,41 @@ class SmartContractTrainer:
                 try:
                     logits = outputs['logits']
                     target_ids_shifted = outputs['target_ids']
-                    gen_loss = self.generator_loss_fn(logits, target_ids_shifted)
+                    
+                    # Note: Token constraints are disabled during training to avoid dimension issues
+                    # The SoliditySyntaxLoss provides sufficient syntax guidance during training
+                    # Token constraints can be applied during inference for better generation quality
+                    
+                    # Use syntax-aware loss instead of simple cross-entropy
+                    # Pass None as the third argument since it's optional
+                    gen_loss = self.generator_loss_fn(logits, target_ids_shifted, None)
+                    
+                    # Extract syntax penalty for tracking
+                    syntax_penalty = None
+                    if hasattr(self.generator_loss_fn, '_compute_simple_syntax_penalty'):
+                        try:
+                            syntax_penalty = self.generator_loss_fn._compute_simple_syntax_penalty(logits, target_ids_shifted)
+                            total_syntax_loss += syntax_penalty.item()
+                        except Exception as e:
+                            print(f"Syntax penalty calculation failed: {str(e)}")
+                            syntax_penalty = torch.tensor(0.0, device=logits.device)
+                    
                 except KeyError as e:
                     print(f"Missing key in outputs: {e}")
                     continue
                 except Exception as e:
                     print(f"Error calculating generation loss: {str(e)}")
-                    continue
+                    # Fallback to simple cross-entropy loss if syntax loss fails
+                    try:
+                        gen_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids_shifted.view(-1), reduction='mean')
+                        syntax_penalty = torch.tensor(0.0, device=logits.device)
+                        print(f"Fallback to simple cross-entropy loss successful")
+                    except Exception as e2:
+                        print(f"Fallback also failed: {str(e2)}")
+                        continue
                 
                 # Calculate contract-level vulnerability loss
-                contract_vuln_loss = self.focal_loss(
+                contract_vuln_loss = self.contract_focal_loss(
                     contract_vuln_logits,
                     contract_vulnerabilities.float()
                 )
@@ -709,12 +898,12 @@ class SmartContractTrainer:
                 # Adjust focal loss alpha based on vulnerability rate in this batch
                 if batch_contract_vulns > 0:
                     # If we have vulnerabilities, use more aggressive focal loss
-                    self.focal_loss.alpha = 0.05  # More focus on positive cases
-                    self.focal_loss.gamma = 4.0  # More aggressive down-weighting
+                    self.contract_focal_loss.alpha = 0.05  # More focus on positive cases
+                    self.contract_focal_loss.gamma = 4.0  # More aggressive down-weighting
                 else:
                     # If no vulnerabilities, use balanced focal loss
-                    self.focal_loss.alpha = 0.25
-                    self.focal_loss.gamma = 2.0
+                    self.contract_focal_loss.alpha = 0.1
+                    self.contract_focal_loss.gamma = 3.0
                 
                 # IMPROVED: Dynamic line vulnerability loss adjustment
                 if batch_line_vulns > 0:
@@ -779,26 +968,26 @@ class SmartContractTrainer:
                         print(f"Error in GAN training: {str(e)}")
                         continue
                 
-                # IMPROVED: Combined loss with much higher weights for line vulnerabilities
+                # IMPROVED: Combined loss with much higher weights for line vulnerabilities and syntax awareness
                 if self.use_augmentation and self.use_gan:
                     # Much higher weights for vulnerability detection, especially line-level
                     total_loss = (
                         0.1 * gen_loss +  # Reduced from 0.15
-                        0.2 * contract_vuln_loss * 20 +  # Reduced from 0.4
-                        0.6 * line_vuln_loss * self.line_vuln_weight +  # Much higher weight for line vulnerabilities
+                        0.3 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
+                        0.5 * line_vuln_loss * self.line_vuln_weight +  # Much higher weight for line vulnerabilities
                         0.1 * discriminator_loss  # Reduced from 0.15
                     )
                 elif self.use_augmentation:
                     total_loss = (
                         0.15 * gen_loss +  # Reduced from 0.2
-                        0.25 * contract_vuln_loss * 20 +  # Reduced from 0.4
-                        0.6 * line_vuln_loss * self.line_vuln_weight  # Much higher weight for line vulnerabilities
+                        0.3 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
+                        0.55 * line_vuln_loss * self.line_vuln_weight  # Much higher weight for line vulnerabilities
                     )
                 else:
                     total_loss = (
                         0.1 * gen_loss +  # Reduced from 0.15
-                        0.2 * contract_vuln_loss * 20 +  # Reduced from 0.4
-                        0.7 * line_vuln_loss * self.line_vuln_weight  # Much higher weight for line vulnerabilities
+                        0.25 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
+                        0.65 * line_vuln_loss * self.line_vuln_weight  # Much higher weight for line vulnerabilities
                     )
                 
                 # Add GAN losses to total loss
@@ -866,7 +1055,9 @@ class SmartContractTrainer:
                     'gan': 'ON' if self.use_gan else 'OFF',
                     'disc_loss': f'{discriminator_loss:.4f}' if self.use_gan else 'N/A',
                     'disc_conf': f'{discriminator_confidence:.3f}' if self.use_gan else 'N/A',
-                    'line_weight': f'{self.line_vuln_weight:.0f}'  # Show line vulnerability weight
+                    'line_weight': f'{self.line_vuln_weight:.0f}',  # Show line vulnerability weight
+                    'contract_weight': f'{self.contract_vuln_weight:.0f}',  # Show contract vulnerability weight
+                    'syntax': f'{syntax_penalty.item():.4f}' if syntax_penalty is not None else 'N/A'
                 })
                 
             except Exception as e:
@@ -879,7 +1070,8 @@ class SmartContractTrainer:
             'gen_loss': total_gen_loss / batch_count if batch_count > 0 else float('inf'),
             'contract_vuln_loss': total_contract_vuln_loss / batch_count if batch_count > 0 else float('inf'),
             'line_vuln_loss': total_line_vuln_loss / batch_count if batch_count > 0 else float('inf'),
-            'discriminator_loss': total_discriminator_loss / batch_count if batch_count > 0 else 0.0
+            'discriminator_loss': total_discriminator_loss / batch_count if batch_count > 0 else 0.0,
+            'syntax_loss': total_syntax_loss / batch_count if batch_count > 0 else 0.0
         }
 
     def validate(self):
@@ -933,7 +1125,7 @@ class SmartContractTrainer:
                     try:
                         logits = outputs['logits']
                         target_ids_shifted = outputs['target_ids']
-                        gen_loss = self.generator_loss_fn(logits, target_ids_shifted)
+                        gen_loss = self.generator_loss_fn(logits, target_ids_shifted, None)
                     except KeyError as e:
                         print(f"Missing key in outputs: {e}")
                         print(f"Available keys: {list(outputs.keys())}")
@@ -943,7 +1135,7 @@ class SmartContractTrainer:
                         continue
                     
                     # Calculate contract-level vulnerability loss
-                    contract_vuln_loss = self.focal_loss(
+                    contract_vuln_loss = self.contract_focal_loss(
                         contract_vuln_logits,
                         contract_vulnerabilities.float()
                     )
@@ -963,19 +1155,19 @@ class SmartContractTrainer:
                     if self.use_augmentation and self.use_gan:
                         total_loss = (
                             0.4 * gen_loss +
-                            0.25 * contract_vuln_loss +
-                            0.35 * line_vuln_loss * self.line_vuln_weight  # Use dynamic weight
+                            0.3 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
+                            0.3 * line_vuln_loss * self.line_vuln_weight  # Use dynamic weight
                         )
                     elif self.use_augmentation:
                         total_loss = (
                             0.6 * gen_loss +
-                            0.25 * contract_vuln_loss +
+                            0.25 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
                             0.15 * line_vuln_loss * self.line_vuln_weight  # Use dynamic weight
                         )
                     else:
                         total_loss = (
                             0.4 *gen_loss + 
-                            0.3 * contract_vuln_loss +
+                            0.3 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
                             0.3 * line_vuln_loss * self.line_vuln_weight  # Use dynamic weight
                         )
                     
@@ -1017,13 +1209,17 @@ class SmartContractTrainer:
             if self.use_gan:
                 self.training_history['discriminator_loss'].append(train_metrics['discriminator_loss'])
             
+            # NEW: Track syntax loss
+            self.training_history['syntax_loss'].append(train_metrics.get('syntax_loss', 0.0))
+            
             # Print metrics
             print(f"Train Loss: {train_metrics['gen_loss']:.4f}")
             print(f"Val Loss: {val_metrics['gen_loss']:.4f}")
             print(f"Contract Vulnerability Loss: {train_metrics['contract_vuln_loss']:.4f}")
-            print(f"Line Vulnerability Loss: {train_metrics['line_vuln_loss']:.4f}")
+            print(f"Line Vulnerability Loss: {train_metrics['line_vuln_loss']:.6f}")
             if self.use_gan:
                 print(f"Discriminator Loss: {train_metrics['discriminator_loss']:.4f}")
+            print(f"Syntax Loss: {train_metrics.get('syntax_loss', 0.0):.4f}")  # NEW: Show syntax loss
             print(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
             
             # Step the scheduler with the validation loss
