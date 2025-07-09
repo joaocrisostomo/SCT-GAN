@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.nn import TransformerEncoder, TransformerDecoder, TransformerEncoderLayer, TransformerDecoderLayer
 from transformers import AutoModel, AutoTokenizer
 import math
+import torch.nn.functional as F # Added for F.gelu
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -47,6 +48,9 @@ class SmartContractTransformer(nn.Module):
         self.ast_embedding = nn.Embedding(vocab_size, d_model)
         self.ast_embedding_dropout = nn.Dropout(dropout)
         self.ast_embedding_norm = nn.LayerNorm(d_model)
+        
+        # Path embedding for beam search (alias for ast_embedding)
+        self.path_embedding = self.ast_embedding
         
         # Transformer encoder with improved configuration and more dropout
         encoder_layer = TransformerEncoderLayer(
@@ -111,27 +115,95 @@ class SmartContractTransformer(nn.Module):
             nn.Linear(d_model // 2, num_vulnerability_types)
         )
         
-        # IMPROVED: Line-level vulnerability detection with spatial attention
-        # Spatial attention for capturing local context
-        self.spatial_attention = nn.MultiheadAttention(
+        # IMPROVED: Line-level vulnerability detection with much stronger architecture
+        # Enhanced line feature extraction with attention and context
+        self.line_feature_extractor = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model)
+        )
+        
+        # NEW: Custom line feature extractor with residual connection and better stability
+        class ResidualLineFeatureExtractor(nn.Module):
+            def __init__(self, d_model):
+                super().__init__()
+                self.linear1 = nn.Linear(d_model, d_model)
+                self.norm1 = nn.LayerNorm(d_model, eps=1e-5)  # Increased epsilon for stability
+                self.linear2 = nn.Linear(d_model, d_model)
+                self.norm2 = nn.LayerNorm(d_model, eps=1e-5)  # Increased epsilon for stability
+                self.dropout = nn.Dropout(0.1)  # Add dropout for regularization
+                
+            def forward(self, x):
+                # Residual connection to preserve input
+                residual = x
+                
+                # First transformation
+                x = self.linear1(x)
+                x = self.norm1(x)
+                x = F.gelu(x)  # Use F.gelu instead of torch.gelu
+                x = self.dropout(x)
+                
+                # Second transformation
+                x = self.linear2(x)
+                x = self.norm2(x)
+                x = self.dropout(x)
+                
+                # Residual connection with scaling to prevent gradient issues
+                return x + 0.1 * residual  # Scale residual to prevent gradient explosion
+        
+        self.line_feature_extractor = ResidualLineFeatureExtractor(d_model)
+        
+        # NEW: Simplified line-specific attention for vulnerability detection
+        self.line_vuln_attention = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=nhead,
-            dropout=dropout,
+            dropout=dropout * 0.2,  # Reduced dropout
             batch_first=True
         )
         
-        # Line-level vulnerability detection head with spatial context
-        self.line_vulnerability_head = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),  # *2 for spatial context
-            nn.LayerNorm(d_model),
+        # NEW: Simplified vulnerability type-specific attention
+        self.vuln_type_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout * 0.2,  # Reduced dropout
+            batch_first=True
+        )
+        
+        # NEW: Completely redesigned simple and robust line vulnerability head
+        # Remove all LayerNorm layers that are causing the zero outputs
+        self.line_vulnerability_head_1 = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),  # Input: concatenated features
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(0.1),
             nn.Linear(d_model, d_model // 2),
-            nn.LayerNorm(d_model // 2),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(0.1),
             nn.Linear(d_model // 2, num_vulnerability_types)
         )
+        
+        # NEW: Simplified line-specific processor without LayerNorm
+        self.line_specific_processor = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+        
+        # NEW: Simplified vulnerability type-specific processors without LayerNorm
+        self.vuln_type_processor = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model // 2, d_model // 4),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(d_model // 4, 1)
+            ) for _ in range(num_vulnerability_types)
+        ])
+        
+        # NEW: Add debugging to understand the flow
+        self._debug_mode = False
         
         # AST path attention layer with more dropout
         self.ast_attention = nn.MultiheadAttention(
@@ -203,6 +275,9 @@ class SmartContractTransformer(nn.Module):
         self.vocab_size = vocab_size
         self.num_vulnerability_types = num_vulnerability_types
         
+        # NEW: Learnable embedding for empty lines
+        self.empty_line_embedding = nn.Parameter(torch.zeros(d_model))
+        
         # Initialize weights with better initialization
         self._init_weights()
         
@@ -232,10 +307,66 @@ class SmartContractTransformer(nn.Module):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 nn.init.constant_(module.bias, 0.0)
         
-        for module in self.line_vulnerability_head.modules():
+        # IMPROVED: Initialize line vulnerability heads with stable weights
+        for module in self.line_feature_extractor.modules():
             if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
-                nn.init.constant_(module.bias, 0.0)
+                nn.init.xavier_uniform_(module.weight, gain=0.8)  # Reduced gain for stability
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+        
+        # NEW: Initialize line feature extractor with identity-like weights to prevent collapse
+        for i, module in enumerate(self.line_feature_extractor.modules()):
+            if isinstance(module, nn.Linear):
+                # Initialize with small random weights to preserve input structure
+                nn.init.normal_(module.weight, mean=0.0, std=0.1)  # Small random weights
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+                print(f"DEBUG: Initialized line feature extractor layer {i} with small random weights")
+        
+        # NEW: Initialize custom line feature extractor with small weights
+        if hasattr(self.line_feature_extractor, 'linear1'):
+            nn.init.normal_(self.line_feature_extractor.linear1.weight, mean=0.0, std=0.1)
+            nn.init.constant_(self.line_feature_extractor.linear1.bias, 0.0)
+            nn.init.normal_(self.line_feature_extractor.linear2.weight, mean=0.0, std=0.1)
+            nn.init.constant_(self.line_feature_extractor.linear2.bias, 0.0)
+            print("DEBUG: Initialized custom line feature extractor with small weights")
+        
+        # NEW: Initialize attention layers with stable weights
+        for module in [self.line_vuln_attention, self.vuln_type_attention]:
+            for param in module.parameters():
+                if param.dim() > 1:
+                    nn.init.xavier_uniform_(param, gain=0.8)  # Reduced gain for stability
+                else:
+                    nn.init.constant_(param, 0.0)
+        
+        # Initialize line vulnerability head with better weights for simplified architecture
+        for module in self.line_vulnerability_head_1.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=1.0)  # Standard gain for better gradients
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+        
+        # NEW: Initialize line-specific processor with better weights
+        for module in self.line_specific_processor.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=1.0)  # Standard gain
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+        
+        # NEW: Initialize vulnerability type-specific processors with better weights
+        for vuln_processor in self.vuln_type_processor:
+            for module in vuln_processor.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=1.0)  # Standard gain
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0.0)
+        
+        # IMPROVED: Initialize the final output layer with reasonable weights
+        final_layer = self.line_vulnerability_head_1[-1]  # Get the last layer
+        if isinstance(final_layer, nn.Linear):
+            nn.init.normal_(final_layer.weight, mean=0.0, std=0.1)  # Reasonable std
+            if final_layer.bias is not None:
+                nn.init.constant_(final_layer.bias, -0.2)  # Less conservative negative bias
         
         # Initialize discriminator components if GAN is enabled
         if self.use_gan:
@@ -344,18 +475,361 @@ class SmartContractTransformer(nn.Module):
         # Get contract-level vulnerability predictions
         contract_vuln_logits = self.contract_vulnerability_head(contract_features)  # [batch_size, num_vuln_types]
         
-        # IMPROVED: Get line-level vulnerability predictions with spatial context
-        # Apply spatial attention to capture local context
-        spatial_context, _ = self.spatial_attention(
-            query=memory,
-            key=memory,
-            value=memory,
-            attn_mask=None  # Allow full attention for spatial context
-        )
+        # IMPROVED: Get line-level vulnerability predictions with stable architecture
+        # Aggregate encoder outputs per line using token_to_line
+        if token_to_line is not None:
+            # memory: [batch_size, seq_len, d_model]
+            # token_to_line: [batch_size, seq_len] (int: line index for each token)
+            batch_size, seq_len, d_model = memory.shape
+            max_lines = token_to_line.max().item() + 1  # number of lines in the contract
+            
+            # NEW: Debug line aggregation
+            if hasattr(self, '_debug_mode') and self._debug_mode:
+                print(f"DEBUG: Starting line aggregation...")
+                print(f"DEBUG: batch_size={batch_size}, seq_len={seq_len}, d_model={d_model}")
+                print(f"DEBUG: max_lines={max_lines}")
+                print(f"DEBUG: token_to_line shape={token_to_line.shape}")
+                print(f"DEBUG: token_to_line sample values: {token_to_line[0, :10].tolist()}")
+            
+            # Create line-specific features with position encoding
+            line_features = []
+            for b in range(batch_size):
+                # For each line, average the features of all tokens that belong to that line
+                this_token_to_line = token_to_line[b]  # [seq_len]
+                this_memory = memory[b]  # [seq_len, d_model]
+                lines = []
+                for line_idx in range(max_lines):
+                    mask = (this_token_to_line == line_idx)
+                    if mask.any():
+                        # Get the mean of tokens for this line
+                        line_tokens = this_memory[mask]  # [num_tokens_in_line, d_model]
+                        
+                        # DEBUG: Check line_tokens shape
+                        if hasattr(self, '_debug_mode') and self._debug_mode and b == 0 and line_idx < 3:
+                            print(f"DEBUG: Line {line_idx}: line_tokens shape: {line_tokens.shape}, expected: [num_tokens, {d_model}]")
+                        
+                        # Ensure we get a 1D tensor of shape [d_model]
+                        if line_tokens.dim() == 2:
+                            line_feature = line_tokens.mean(dim=0)  # [d_model]
+                        else:
+                            line_feature = line_tokens.squeeze()  # [d_model]
+                        
+                        # DEBUG: Check line_feature shape before reshaping
+                        if hasattr(self, '_debug_mode') and self._debug_mode and b == 0 and line_idx < 3:
+                            print(f"DEBUG: Line {line_idx}: line_feature shape before reshape: {line_feature.shape}, numel: {line_feature.numel()}, expected: {d_model}")
+                        
+                        # Ensure it's exactly [d_model] shape - FIX: Use reshape instead of view
+                        if line_feature.numel() != d_model:
+                            # If the tensor has wrong size, reshape it properly
+                            if line_feature.numel() > d_model:
+                                line_feature = line_feature[:d_model]  # Truncate if too large
+                                if hasattr(self, '_debug_mode') and self._debug_mode and b == 0 and line_idx < 3:
+                                    print(f"DEBUG: Line {line_idx}: Truncated line_feature from {line_feature.numel()} to {d_model}")
+                            else:
+                                # Pad if too small
+                                pad_size = d_model - line_feature.numel()
+                                line_feature = torch.cat([line_feature.flatten(), torch.zeros(pad_size, device=line_feature.device)])
+                                if hasattr(self, '_debug_mode') and self._debug_mode and b == 0 and line_idx < 3:
+                                    print(f"DEBUG: Line {line_idx}: Padded line_feature from {line_feature.numel() - pad_size} to {d_model}")
+                        else:
+                            line_feature = line_feature.reshape(d_model)  # Ensure correct shape
+                        # Add line position encoding to make each line unique
+                        line_feature = line_feature + self._get_line_position_encoding(line_idx, d_model, device=memory.device)
+                        lines.append(line_feature)
+                        
+                        # NEW: Debug line feature creation
+                        if hasattr(self, '_debug_mode') and self._debug_mode and b == 0 and line_idx < 3:
+                            print(f"DEBUG: Line {line_idx}: tokens={mask.sum().item()}, feature_range=[{line_feature.min().item():.4f}, {line_feature.max().item():.4f}]")
+                    else:
+                        # Use learnable embedding for empty lines with position encoding
+                        empty_embedding = self.empty_line_embedding + self._get_line_position_encoding(line_idx, d_model, device=memory.device)
+                        lines.append(empty_embedding)
+                        
+                        # NEW: Debug empty line
+                        if hasattr(self, '_debug_mode') and self._debug_mode and b == 0 and line_idx < 3:
+                            print(f"DEBUG: Line {line_idx}: empty, embedding_range=[{empty_embedding.min().item():.4f}, {empty_embedding.max().item():.4f}]")
+                
+                # Verify all tensors have the same shape before stacking
+                for i, line in enumerate(lines):
+                    if line.shape != torch.Size([d_model]):
+                        print(f"Warning: Line {i} has shape {line.shape}, expected {d_model}")
+                        # Force reshape to correct size
+                        lines[i] = line.view(-1)[:d_model]
+                        if lines[i].shape[0] < d_model:
+                            # Pad if too short
+                            pad_size = d_model - lines[i].shape[0]
+                            lines[i] = torch.cat([lines[i], torch.zeros(pad_size, device=lines[i].device)])
+                
+                lines = torch.stack(lines, dim=0)  # [num_lines, d_model]
+                line_features.append(lines)
+                
+                # NEW: Debug stacked lines
+                if hasattr(self, '_debug_mode') and self._debug_mode and b == 0:
+                    print(f"DEBUG: Stacked lines shape: {lines.shape}")
+                    print(f"DEBUG: Stacked lines range: [{lines.min().item():.4f}, {lines.max().item():.4f}]")
+                    print(f"DEBUG: Stacked lines std: {lines.std().item():.6f}")
+            
+            # Pad to max_lines across batch
+            max_lines_in_batch = max([lf.shape[0] for lf in line_features])
+            for i in range(len(line_features)):
+                if line_features[i].shape[0] < max_lines_in_batch:
+                    pad = torch.zeros((max_lines_in_batch - line_features[i].shape[0], d_model), device=memory.device)
+                    line_features[i] = torch.cat([line_features[i], pad], dim=0)
+            line_features = torch.stack(line_features, dim=0)  # [batch_size, max_lines, d_model]
+            
+            # NEW: Debug final line_features
+            if hasattr(self, '_debug_mode') and self._debug_mode:
+                print(f"DEBUG: Final line_features shape: {line_features.shape}")
+                print(f"DEBUG: Final line_features range: [{line_features.min().item():.4f}, {line_features.max().item():.4f}]")
+                print(f"DEBUG: Final line_features std: {line_features.std().item():.6f}")
+        else:
+            # Fallback: use per-token features (legacy behavior)
+            line_features = memory  # Use raw memory instead of feature extraction
+
+        # CRITICAL FIX: Store the original line_features before processing
+        original_line_features = line_features.clone()  # [batch_size, num_lines, d_model]
+
+        # NEW: Debug to verify original line features are preserved
+        if hasattr(self, '_debug_mode') and self._debug_mode:
+            print(f"DEBUG: original_line_features shape: {original_line_features.shape}")
+            print(f"DEBUG: original_line_features range: [{original_line_features.min().item():.4f}, {original_line_features.max().item():.4f}]")
+            print(f"DEBUG: original_line_features std: {original_line_features.std().item():.6f}")
+            print(f"DEBUG: line_features before extractor shape: {line_features.shape}")
+            print(f"DEBUG: line_features before extractor range: [{line_features.min().item():.4f}, {line_features.max().item():.4f}]")
+            print(f"DEBUG: line_features before extractor std: {line_features.std().item():.6f}")
+            
+            # Check if line_features and original_line_features are the same
+            if torch.allclose(line_features, original_line_features):
+                print("✓ DEBUG: line_features and original_line_features are identical")
+            else:
+                print("⚠️  DEBUG: line_features and original_line_features are different!")
+                diff = torch.abs(line_features - original_line_features).mean().item()
+                print(f"DEBUG: Average difference: {diff:.6f}")
+
+        # Process line_features through the feature extractor (only once)
+        original_line_features = line_features.clone()  # Keep original for fallback
+        line_features = self.line_feature_extractor(line_features)  # [batch_size, num_lines, d_model]
         
-        # Combine original features with spatial context
-        line_features = torch.cat([memory, spatial_context], dim=-1)  # [batch_size, seq_len, d_model*2]
-        line_vuln_logits = self.line_vulnerability_head(line_features)  # [batch_size, seq_len, num_vuln_types]
+        # NEW: Fallback mechanism - if line feature extractor produces zeros, use original features
+        if line_features.std().item() < 1e-6:
+            print("⚠️  DEBUG: Line feature extractor produced zeros, using original features")
+            line_features = original_line_features * 0.1  # Scale down to prevent gradient explosion
+        
+        # NEW: Debug to verify original line features are preserved
+        if hasattr(self, '_debug_mode') and self._debug_mode:
+            print(f"DEBUG: processed line_features range: [{line_features.min().item():.4f}, {line_features.max().item():.4f}]")
+            print(f"DEBUG: processed line_features std: {line_features.std().item():.6f}")
+            
+            # Check if the extractor killed the features
+            if line_features.std().item() < 1e-6:
+                print("⚠️  DEBUG: Line feature extractor produced all zeros!")
+                print("This suggests the extractor architecture has an issue")
+            else:
+                print("✓ DEBUG: Line feature extractor produced varied outputs")
+        
+        # Apply attention with smaller residual connections for stability
+        line_attn_output, _ = self.line_vuln_attention(
+            query=line_features,
+            key=line_features,
+            value=line_features,
+            attn_mask=None
+        )
+        line_features = line_features + 0.05 * line_attn_output  # Smaller residual connection
+        
+        vuln_type_attn_output, _ = self.vuln_type_attention(
+            query=line_features,
+            key=line_features,
+            value=line_features,
+            attn_mask=None
+        )
+        line_features = line_features + 0.05 * vuln_type_attn_output  # Smaller residual connection
+        
+        # Use both original and attended features for better representation
+        combined_features = torch.cat([line_features, line_attn_output], dim=-1)  # [batch_size, num_lines, d_model*2]
+        
+        # NEW: Process each line individually to ensure uniqueness
+        batch_size, num_lines, _ = combined_features.shape
+        line_vuln_logits = []
+        
+        # NEW: Debug line-specific processing
+        if hasattr(self, '_debug_mode') and self._debug_mode:
+            print(f"DEBUG: Processing {num_lines} lines individually...")
+        
+        for line_idx in range(num_lines):
+            # Get features for this specific line
+            line_feature = combined_features[:, line_idx, :]  # [batch_size, d_model*2]
+            
+            # NEW: Debug line features
+            if hasattr(self, '_debug_mode') and self._debug_mode and line_idx < 3:
+                print(f"DEBUG: Line {line_idx} feature range: [{line_feature.min().item():.4f}, {line_feature.max().item():.4f}], std: {line_feature.std().item():.6f}")
+            
+            # Process through the main head
+            main_output = self.line_vulnerability_head_1(line_feature)  # [batch_size, num_vuln_types]
+            
+            # NEW: Debug main output
+            if hasattr(self, '_debug_mode') and self._debug_mode and line_idx < 3:
+                print(f"DEBUG: Line {line_idx} main_output range: [{main_output.min().item():.4f}, {main_output.max().item():.4f}], std: {main_output.std().item():.6f}")
+            
+            # Process through line-specific processor using ORIGINAL line features
+            line_specific_feature = self.line_specific_processor(original_line_features[:, line_idx, :])  # [batch_size, d_model//2]
+            
+            # NEW: Debug line-specific features
+            if hasattr(self, '_debug_mode') and self._debug_mode and line_idx < 3:
+                print(f"DEBUG: Line {line_idx} line_specific_feature range: [{line_specific_feature.min().item():.4f}, {line_specific_feature.max().item():.4f}], std: {line_specific_feature.std().item():.6f}")
+            
+            # Process each vulnerability type separately
+            vuln_type_outputs = []
+            for vuln_type_idx in range(self.num_vulnerability_types):
+                vuln_output = self.vuln_type_processor[vuln_type_idx](line_specific_feature)  # [batch_size, 1]
+                vuln_type_outputs.append(vuln_output)
+            
+            # Combine main output with type-specific outputs
+            type_specific_output = torch.cat(vuln_type_outputs, dim=1)  # [batch_size, num_vuln_types]
+            
+            # NEW: Debug type-specific output
+            if hasattr(self, '_debug_mode') and self._debug_mode and line_idx < 3:
+                print(f"DEBUG: Line {line_idx} type_specific_output range: [{type_specific_output.min().item():.4f}, {type_specific_output.max().item():.4f}], std: {type_specific_output.std().item():.6f}")
+            
+            # Combine both outputs with learnable weights
+            combined_output = main_output + 0.1 * type_specific_output  # [batch_size, num_vuln_types]
+            
+            # NEW: Debug final combined output
+            if hasattr(self, '_debug_mode') and self._debug_mode and line_idx < 3:
+                print(f"DEBUG: Line {line_idx} combined_output range: [{combined_output.min().item():.4f}, {combined_output.max().item():.4f}], std: {combined_output.std().item():.6f}")
+            
+            line_vuln_logits.append(combined_output)
+        
+        # Stack all line outputs
+        line_vuln_logits = torch.stack(line_vuln_logits, dim=1)  # [batch_size, num_lines, num_vuln_types]
+        
+        # NEW: Debug stacked outputs
+        if hasattr(self, '_debug_mode') and self._debug_mode:
+            print(f"DEBUG: Stacked line_vuln_logits shape: {line_vuln_logits.shape}")
+            print(f"DEBUG: Stacked line_vuln_logits range: [{line_vuln_logits.min().item():.4f}, {line_vuln_logits.max().item():.4f}], std: {line_vuln_logits.std().item():.6f}")
+            
+            # Compare first few lines
+            if line_vuln_logits.shape[1] > 1:
+                line_0_output = line_vuln_logits[0, 0, :]  # First line, first batch
+                line_1_output = line_vuln_logits[0, 1, :]  # Second line, first batch
+                line_diff = torch.abs(line_0_output - line_1_output).mean().item()
+                print(f"DEBUG: Stacked line difference (0 vs 1): {line_diff:.6f}")
+                
+                if line_diff < 1e-6:
+                    print("⚠️  DEBUG: Stacked outputs are identical! Issue is in the processing loop.")
+                else:
+                    print("✓ DEBUG: Stacked outputs are different.")
+        
+        # PAD/TRUNCATE line_vuln_logits to [batch_size, 1024, num_vuln_types] to match targets
+        max_lines = 1024  # or self.max_length
+        if line_vuln_logits.shape[1] < max_lines:
+            pad = torch.zeros(
+                (line_vuln_logits.shape[0], max_lines - line_vuln_logits.shape[1], line_vuln_logits.shape[2]),
+                device=line_vuln_logits.device
+            )
+            line_vuln_logits = torch.cat([line_vuln_logits, pad], dim=1)
+        elif line_vuln_logits.shape[1] > max_lines:
+            line_vuln_logits = line_vuln_logits[:, :max_lines, :]
+        
+        # NEW: Add debugging to understand the flow
+        if hasattr(self, '_debug_mode') and self._debug_mode:
+            print(f"DEBUG: memory range: [{memory.min().item():.4f}, {memory.max().item():.4f}]")
+            
+            # Debug line aggregation
+            if token_to_line is not None:
+                print(f"DEBUG: token_to_line shape: {token_to_line.shape}")
+                print(f"DEBUG: token_to_line range: [{token_to_line.min().item()}, {token_to_line.max().item()}]")
+                print(f"DEBUG: max_lines: {max_lines}")
+                
+                # Check if line_features are being created correctly
+                print(f"DEBUG: line_features before extractor shape: {line_features.shape}")
+                print(f"DEBUG: line_features before extractor range: [{line_features.min().item():.4f}, {line_features.max().item():.4f}]")
+                print(f"DEBUG: line_features before extractor std: {line_features.std().item():.6f}")
+            
+            # Test each layer of the line feature extractor
+            x = line_features  # Use line_features instead of memory
+            print(f"DEBUG: Input to line feature extractor range: [{x.min().item():.4f}, {x.max().item():.4f}]")
+            
+            # Handle custom ResidualLineFeatureExtractor
+            if hasattr(self.line_feature_extractor, 'linear1'):
+                # Custom module - test individual components
+                x = self.line_feature_extractor.linear1(x)
+                print(f"DEBUG: After Linear 1: range [{x.min().item():.4f}, {x.max().item():.4f}], std {x.std().item():.6f}")
+                x = self.line_feature_extractor.norm1(x)
+                print(f"DEBUG: After LayerNorm 1: range [{x.min().item():.4f}, {x.max().item():.4f}], std {x.std().item():.6f}")
+                x = F.gelu(x)
+                print(f"DEBUG: After GELU: range [{x.min().item():.4f}, {x.max().item():.4f}], std {x.std().item():.6f}")
+                x = self.line_feature_extractor.linear2(x)
+                print(f"DEBUG: After Linear 2: range [{x.min().item():.4f}, {x.max().item():.4f}], std {x.std().item():.6f}")
+                x = self.line_feature_extractor.norm2(x)
+                print(f"DEBUG: After LayerNorm 2: range [{x.min().item():.4f}, {x.max().item():.4f}], std {x.std().item():.6f}")
+            else:
+                # Sequential module - iterate normally
+                for i, layer in enumerate(self.line_feature_extractor):
+                    x = layer(x)
+                    if isinstance(layer, nn.Linear):
+                        print(f"DEBUG: After Linear {i}: range [{x.min().item():.4f}, {x.max().item():.4f}], std {x.std().item():.6f}")
+                    elif isinstance(layer, nn.GELU):
+                        print(f"DEBUG: After GELU {i}: range [{x.min().item():.4f}, {x.max().item():.4f}], std {x.std().item():.6f}")
+                    elif isinstance(layer, nn.LayerNorm):
+                        print(f"DEBUG: After LayerNorm {i}: range [{x.min().item():.4f}, {x.max().item():.4f}], std {x.std().item():.6f}")
+                    elif isinstance(layer, nn.Dropout):
+                        print(f"DEBUG: After Dropout {i}: range [{x.min().item():.4f}, {x.max().item():.4f}], std {x.std().item():.6f}")
+            
+            line_features = x
+            print(f"DEBUG: line_features after extractor range: [{line_features.min().item():.4f}, {line_features.max().item():.4f}]")
+            print(f"DEBUG: line_features after extractor std: {line_features.std().item():.6f}")
+            
+            # Debug attention outputs
+            print(f"DEBUG: line_attn_output range: [{line_attn_output.min().item():.4f}, {line_attn_output.max().item():.4f}]")
+            print(f"DEBUG: vuln_type_attn_output range: [{vuln_type_attn_output.min().item():.4f}, {vuln_type_attn_output.max().item():.4f}]")
+            
+            # Debug combined features
+            print(f"DEBUG: combined_features range: [{combined_features.min().item():.4f}, {combined_features.max().item():.4f}]")
+            print(f"DEBUG: combined_features std: {combined_features.std().item():.6f}")
+            
+            print(f"DEBUG: line_vuln_logits range: [{line_vuln_logits.min().item():.4f}, {line_vuln_logits.max().item():.4f}]")
+            print(f"DEBUG: line_vuln_logits std: {line_vuln_logits.std().item():.6f}")
+            
+            # NEW: Test if different lines have different outputs
+            if line_vuln_logits.shape[1] > 1:  # If we have multiple lines
+                line_0_output = line_vuln_logits[0, 0, :]  # First line, first batch
+                line_1_output = line_vuln_logits[0, 1, :]  # Second line, first batch
+                line_diff = torch.abs(line_0_output - line_1_output).mean().item()
+                print(f"DEBUG: Difference between line 0 and line 1: {line_diff:.6f}")
+                
+                if line_diff < 1e-6:
+                    print("⚠️  DEBUG: Lines 0 and 1 have identical outputs!")
+                    print("This suggests the line-specific processing is not working")
+                    
+                    # Debug the individual processing steps
+                    print("DEBUG: Investigating why lines are identical...")
+                    line_0_feature = combined_features[0, 0, :]  # First line features
+                    line_1_feature = combined_features[0, 1, :]  # Second line features
+                    feature_diff = torch.abs(line_0_feature - line_1_feature).mean().item()
+                    print(f"DEBUG: Feature difference between line 0 and 1: {feature_diff:.6f}")
+                    
+                    if feature_diff < 1e-6:
+                        print("⚠️  DEBUG: Line features are identical! The issue is in line aggregation.")
+                    else:
+                        print("✓ DEBUG: Line features are different, issue is in processing.")
+                        
+                else:
+                    print("✓ DEBUG: Lines 0 and 1 have different outputs")
+                    print(f"Line 0: {line_0_output[:3].tolist()}...")  # Show first 3 values
+                    print(f"Line 1: {line_1_output[:3].tolist()}...")  # Show first 3 values
+            
+            # Test if the head is actually processing the input
+            if line_vuln_logits.std().item() < 1e-6:
+                print("⚠️  DEBUG: Line vulnerability head is producing constant outputs!")
+                print("This suggests the head might not be processing the input correctly")
+            else:
+                print("✓ DEBUG: Line vulnerability head is producing varied outputs")
+        
+        # Debug prints removed to reduce output clutter
+        
+        # NEW: Add epoch tracking to model for debugging
+        if hasattr(self, 'current_epoch'):
+            self.current_epoch = getattr(self, 'current_epoch', 0)
         
         if target_ids is None:
             # Generate sequence with improved logic
@@ -523,41 +997,34 @@ class SmartContractTransformer(nn.Module):
             
             # Try to decode the last token (this is a simplified approach)
             # In practice, you'd want to maintain a proper token-to-string mapping
-            try:
-                # For now, we'll use a simple heuristic based on token IDs
-                # This is a placeholder - you'd want to use the actual tokenizer
+            
+            # Common token ID ranges for different types of tokens
+            # These are approximate and would need to be adjusted for your specific tokenizer
+            
+            # Check if the last token looks like a keyword that needs constraints
+            if last_token in [1024, 1025, 1026]:  # Example token IDs for function, contract, if
+                # Apply keyword-specific constraints
+                # This is where you'd implement the actual constraint logic
+                pass
                 
-                # Common token ID ranges for different types of tokens
-                # These are approximate and would need to be adjusted for your specific tokenizer
+            # Check for tokens that should be followed by semicolon
+            elif last_token in [2000, 2001, 2002]:  # Example token IDs for return, break, continue
+                # Increase probability of semicolon
+                semicolon_token_id = 59  # Common semicolon token ID
+                if semicolon_token_id < logits.size(1):
+                    logits[i, semicolon_token_id] *= 2.0  # Double the probability
+                    
+            # Check for opening braces/parentheses
+            elif last_token in [40, 123]:  # '(' or '{'
+                # Track that we need a closing token
+                # This would require maintaining state across generation steps
+                pass
                 
-                # Check if the last token looks like a keyword that needs constraints
-                if last_token in [1024, 1025, 1026]:  # Example token IDs for function, contract, if
-                    # Apply keyword-specific constraints
-                    # This is where you'd implement the actual constraint logic
-                    pass
-                    
-                # Check for tokens that should be followed by semicolon
-                elif last_token in [2000, 2001, 2002]:  # Example token IDs for return, break, continue
-                    # Increase probability of semicolon
-                    semicolon_token_id = 59  # Common semicolon token ID
-                    if semicolon_token_id < logits.size(1):
-                        logits[i, semicolon_token_id] *= 2.0  # Double the probability
-                        
-                # Check for opening braces/parentheses
-                elif last_token in [40, 123]:  # '(' or '{'
-                    # Track that we need a closing token
-                    # This would require maintaining state across generation steps
-                    pass
-                    
-                # Check for closing braces/parentheses
-                elif last_token in [41, 125]:  # ')' or '}'
-                    # Ensure we had a matching opening token
-                    # This would require maintaining state across generation steps
-                    pass
-                    
-            except Exception:
-                # If we can't process the token, continue without constraints
-                continue
+            # Check for closing braces/parentheses
+            elif last_token in [41, 125]:  # ')' or '}'
+                # Ensure we had a matching opening token
+                # This would require maintaining state across generation steps
+                pass
         
         # Apply the mask to prevent invalid tokens
         logits = logits.masked_fill(allowed_mask == 0, float('-inf'))
@@ -703,4 +1170,21 @@ class SmartContractTransformer(nn.Module):
         # Binary classification: real (1) vs fake (0)
         synthetic_logits = self.disc_synthetic_head(features)
         
-        return synthetic_logits 
+        return synthetic_logits
+    
+    def set_current_epoch(self, epoch):
+        """Set current epoch for debugging purposes"""
+        self.current_epoch = epoch
+        
+    def _get_line_position_encoding(self, line_idx, d_model, device):
+        """Generate position encoding for a specific line to make it unique"""
+        # Create a simple sinusoidal position encoding
+        position = torch.tensor(line_idx, dtype=torch.float, device=device)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float, device=device) * 
+                           -(math.log(10000.0) / d_model))
+        
+        pos_encoding = torch.zeros(d_model, device=device)
+        pos_encoding[0::2] = torch.sin(position * div_term)
+        pos_encoding[1::2] = torch.cos(position * div_term)
+        
+        return pos_encoding 
