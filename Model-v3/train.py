@@ -119,7 +119,7 @@ class SpatialAwareFocalLoss(nn.Module):
     Focal loss with spatial context awareness for line-level vulnerability detection.
     Considers the spatial relationship between tokens and their vulnerability patterns.
     """
-    def __init__(self, alpha=0.01, gamma=4.0, spatial_weight=0.3, reduction='mean'):
+    def __init__(self, alpha=0.25, gamma=2.0, spatial_weight=0.2, reduction='mean'):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -127,10 +127,38 @@ class SpatialAwareFocalLoss(nn.Module):
         self.reduction = reduction
         
     def forward(self, pred, target, token_to_line=None):
-        # Standard focal loss
+        # NEW: Custom loss that encourages positive predictions for vulnerable lines
+        # Apply sigmoid to get probabilities
+        probs = torch.sigmoid(pred)
+        
+        # Calculate standard focal loss
         bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
         pt = torch.exp(-bce_loss)
         focal_loss = self.alpha * (1-pt)**self.gamma * bce_loss
+        
+        # NEW: Add positive prediction encouragement (less aggressive)
+        # For vulnerable lines (target == 1), encourage higher probabilities
+        vulnerable_mask = (target == 1.0)
+        if vulnerable_mask.any():
+            # Encourage vulnerable lines to have higher probabilities (less aggressive)
+            prob_encouragement = torch.where(
+                vulnerable_mask,
+                torch.relu(0.3 - probs) * 0.5,  # Reduced penalty and threshold
+                torch.tensor(0.0, device=pred.device)
+            )
+            focal_loss = focal_loss + prob_encouragement
+        
+        # NEW: Add negative prediction discouragement (less aggressive)
+        # For non-vulnerable lines (target == 0), discourage very high probabilities
+        non_vulnerable_mask = (target == 0.0)
+        if non_vulnerable_mask.any():
+            # Discourage non-vulnerable lines from having very high probabilities (less aggressive)
+            prob_discouragement = torch.where(
+                non_vulnerable_mask,
+                torch.relu(probs - 0.5) * 0.2,  # Reduced penalty and increased threshold
+                torch.tensor(0.0, device=pred.device)
+            )
+            focal_loss = focal_loss + prob_discouragement
         
         # Add spatial context penalty if token_to_line is provided
         if token_to_line is not None and self.spatial_weight > 0:
@@ -492,16 +520,17 @@ class SmartContractTrainer:
                 discriminator_params.append(param)
             elif 'contract_vulnerability_head' in name or 'contract_feature_aggregation' in name or 'contract_vuln_attention' in name:
                 contract_head_params.append(param)
-            elif 'line_vulnerability_head' in name or 'spatial_attention' in name:
+            elif ('line_vulnerability_head' in name or 'line_feature_extractor' in name or 
+                  'line_vuln_attention' in name or 'vuln_type_attention' in name):
                 line_head_params.append(param)
             else:
                 base_params.append(param)
         
-        # Initialize optimizer with different learning rates for different components
+        # IMPROVED: Initialize optimizer with balanced learning rates
         param_groups = [
             {'params': base_params, 'lr': learning_rate},
-            {'params': contract_head_params, 'lr': learning_rate * 4.0},  # Much higher LR for contract vulnerability heads
-            {'params': line_head_params, 'lr': learning_rate * 8.0},  # Much higher LR for line vulnerability heads
+            {'params': contract_head_params, 'lr': learning_rate * 2.0},  # Moderate LR for contract vulnerability heads
+            {'params': line_head_params, 'lr': learning_rate * 3.0},  # Conservative LR for line vulnerability heads
         ]
         
         # Add discriminator parameters if GAN is enabled
@@ -536,11 +565,11 @@ class SmartContractTrainer:
             reduction='mean'
         )
         
-        # NEW: Spatial-aware focal loss for line vulnerabilities
+        # IMPROVED: Spatial-aware focal loss for line vulnerabilities with balanced parameters
         self.spatial_focal_loss = SpatialAwareFocalLoss(
-            alpha=0.01,  # Very low alpha for extreme imbalance
-            gamma=4.0,   # Higher gamma for more aggressive down-weighting
-            spatial_weight=0.3,  # Weight for spatial context
+            alpha=0.25,  # Standard focal loss alpha
+            gamma=2.0,   # Standard focal loss gamma
+            spatial_weight=0.2,  # Moderate spatial weight
             reduction='mean'
         )
         
@@ -558,7 +587,10 @@ class SmartContractTrainer:
             'line_vuln_loss': [],
             'learning_rate': [],
             'discriminator_loss': [],
-            'syntax_loss': []  # NEW: Track syntax loss
+            'syntax_loss': [],  # NEW: Track syntax loss
+            'line_vuln_accuracy': [],  # NEW: Track line vulnerability accuracy
+            'line_vuln_precision': [],  # NEW: Track line vulnerability precision
+            'line_vuln_recall': []  # NEW: Track line vulnerability recall
         }
         
         # Verify learning rate is set correctly
@@ -634,24 +666,43 @@ class SmartContractTrainer:
         self.line_vuln_rate = line_vuln_rate
         self.vulnerability_type_counts = vulnerability_type_counts
         
-        # IMPROVED: Dynamic loss weights based on vulnerability rates
+        # NEW: Warm-up tracking for line vulnerability detection
+        self.current_epoch = 0
+        self.warmup_epochs = 5  # Warm up over 5 epochs
+        
+        # NEW: Stability tracking to prevent oscillation
+        self.prev_line_recall = 0.0
+        self.prev_line_precision = 0.0
+        self.stability_factor = 1.0
+        
+        # NEW: Add oscillation detection for line vulnerability logits
+        self.prev_line_logit_mean = 0.0
+        self.prev_line_logit_std = 0.0
+        self.oscillation_detected = False
+        self.consecutive_oscillations = 0
+        
+        # NEW: Add adaptive loss scaling
+        self.line_loss_scale = 1.0
+        self.min_line_loss_scale = 0.1
+        self.max_line_loss_scale = 5.0
+        self.loss_warmup_epochs = 5  # Number of epochs to keep line_loss_scale at 1.0
+        
+        # NEW: Add prediction tracking
+        self.total_line_predictions = 0
+        self.batches_with_predictions = 0
+        
+        # IMPROVED: Much more balanced dynamic loss weights based on vulnerability rates
         if line_vuln_rate < 0.001:  # Extreme imbalance
-            self.line_vuln_weight = 1000.0  # Much higher weight for line vulnerabilities
+            self.line_vuln_weight = 5.0  # Much more conservative weight
             print(f"⚠️  Extreme line vulnerability imbalance detected. Using weight: {self.line_vuln_weight}")
         elif line_vuln_rate < 0.01:  # High imbalance
-            self.line_vuln_weight = 500.0
+            self.line_vuln_weight = 3.0  # More conservative weight
             print(f"⚠️  High line vulnerability imbalance detected. Using weight: {self.line_vuln_weight}")
         else:
-            self.line_vuln_weight = 200.0
+            self.line_vuln_weight = 2.0  # Conservative weight
             print(f"Line vulnerability weight: {self.line_vuln_weight}")
         
-        # NEW: Contract vulnerability weight based on imbalance
-        if contract_vuln_rate < 0.5:  # Low contract vulnerability rate
-            self.contract_vuln_weight = 50.0  # Higher weight for contract vulnerabilities
-            print(f"⚠️  Low contract vulnerability rate detected. Using weight: {self.contract_vuln_weight}")
-        else:
-            self.contract_vuln_weight = 20.0
-            print(f"Contract vulnerability weight: {self.contract_vuln_weight}")
+        self.contract_vuln_weight = 3.0  # Conservative contract weight
 
         print("✓ Syntax-aware loss enabled - will penalize invalid Solidity syntax")
         
@@ -665,6 +716,9 @@ class SmartContractTrainer:
             test_ast_attention_mask = torch.ones(2, 1024).to(self.device)
             test_token_to_line = torch.randint(0, 100, (2, 1024)).to(self.device)
             
+            # NEW: Enable debug mode temporarily
+            self.model._debug_mode = True
+            
             with torch.no_grad():
                 test_outputs = self.model(
                     input_ids=test_input_ids,
@@ -675,11 +729,43 @@ class SmartContractTrainer:
                     token_to_line=test_token_to_line
                 )
                 
+                # Disable debug mode after test
+                self.model._debug_mode = False
+                
                 print(f"✓ Model forward pass successful")
                 print(f"✓ Contract vuln logits: {test_outputs['contract_vulnerability_logits'].shape}")
                 print(f"✓ Line vuln logits: {test_outputs['line_vulnerability_logits'].shape}")
                 print(f"✓ Expected contract shape: [2, 8]")
                 print(f"✓ Expected line shape: [2, 1024, 8]")
+                
+                # NEW: Test line vulnerability head outputs
+                line_logits = test_outputs['line_vulnerability_logits']
+                print(f"✓ Line logits range: [{line_logits.min().item():.4f}, {line_logits.max().item():.4f}]")
+                print(f"✓ Line logits mean: {line_logits.mean().item():.4f}")
+                print(f"✓ Line logits std: {line_logits.std().item():.4f}")
+                
+                # Check if line logits are all the same (indicating dead neurons)
+                if line_logits.std().item() < 1e-6:
+                    print("⚠️  WARNING: Line vulnerability logits have very low variance!")
+                    print("This suggests the line vulnerability heads might not be properly initialized")
+                else:
+                    print("✓ Line vulnerability heads appear to be working correctly")
+                
+                # NEW: Test if line vulnerability heads can produce meaningful outputs
+                print(f"✓ Line logits after sigmoid: [{torch.sigmoid(line_logits).min().item():.6f}, {torch.sigmoid(line_logits).max().item():.6f}]")
+                print(f"✓ Line logits predictions: {(torch.sigmoid(line_logits) > 0.5).sum().item()} out of {line_logits.numel()}")
+                
+                # Test with different thresholds
+                for threshold in [0.1, 0.3, 0.5, 0.7, 0.9]:
+                    pred_count = (torch.sigmoid(line_logits) > threshold).sum().item()
+                    print(f"✓ Threshold {threshold}: {pred_count} predictions")
+                
+                # NEW: Test if the model can produce varied outputs
+                if line_logits.std().item() < 1e-3:
+                    print("⚠️  WARNING: Line vulnerability logits still have very low variance!")
+                    print("This suggests the model needs better initialization or architecture")
+                else:
+                    print("✓ Line vulnerability heads are producing varied outputs")
                 
         except Exception as e:
             print(f"✗ Model dimension test failed: {str(e)}")
@@ -782,6 +868,9 @@ class SmartContractTrainer:
     def train_epoch(self, epoch):
         self.model.train()
         
+        # Set current epoch in model for debugging
+        self.model.set_current_epoch(epoch)
+        
         total_gen_loss = 0
         total_contract_vuln_loss = 0
         total_line_vuln_loss = 0
@@ -812,6 +901,10 @@ class SmartContractTrainer:
                 vulnerable_lines = batch['vulnerable_lines']
                 contract_vulnerabilities = batch['contract_vulnerabilities']
                 token_to_line = batch['token_to_line']
+                
+                # NEW: Calculate warm-up factor early in the training loop
+                warmup_factor = min(1.0, (self.current_epoch + 1) / self.warmup_epochs)
+                line_vuln_weight_adjusted = self.line_vuln_weight * warmup_factor * self.stability_factor * self.line_loss_scale
                 
                 # Handle target_ids based on augmentation setting
                 if self.use_augmentation:
@@ -884,42 +977,221 @@ class SmartContractTrainer:
                 )
                 
                 # IMPROVED: Calculate line-level vulnerability loss with spatial awareness
+                # FIXED: Handle transposed dimensions for vulnerable_lines
+                if line_vuln_logits.shape != vulnerable_lines.shape:
+                    # Check if dimensions are transposed and fix them
+                    if (line_vuln_logits.shape[0] == vulnerable_lines.shape[0] and 
+                        line_vuln_logits.shape[1] == vulnerable_lines.shape[2] and 
+                        line_vuln_logits.shape[2] == vulnerable_lines.shape[1]):
+                        # Transpose vulnerable_lines to match line_vuln_logits
+                        vulnerable_lines_for_loss = vulnerable_lines.transpose(1, 2).contiguous()
+                    else:
+                        vulnerable_lines_for_loss = vulnerable_lines
+                else:
+                    vulnerable_lines_for_loss = vulnerable_lines
+                
                 line_vuln_loss = self.spatial_focal_loss(
                     line_vuln_logits.view(-1, self.model.num_vulnerability_types),
-                    vulnerable_lines.view(-1, self.model.num_vulnerability_types).float(),
+                    vulnerable_lines_for_loss.view(-1, self.model.num_vulnerability_types).float(),
                     token_to_line.view(-1) if token_to_line is not None else None
                 )
                 
-                # Dynamic focal loss adjustment based on batch vulnerability distribution
+                # NEW: Calculate line-level metrics for monitoring
+                line_vuln_accuracy = 0.0
+                line_vuln_precision = 0.0
+                line_vuln_recall = 0.0
+                
+                # NEW: Debug line vulnerability logits
+                if batch_idx == 0:  # Only print for first batch to avoid spam
+                    print(f"\n=== Line Vulnerability Debug (Batch {batch_idx}) ===")
+                    print(f"Line vuln logits shape: {line_vuln_logits.shape}")
+                    print(f"Line vuln logits range: [{line_vuln_logits.min().item():.6f}, {line_vuln_logits.max().item():.6f}]")
+                    print(f"Line vuln logits mean: {line_vuln_logits.mean().item():.6f}")
+                    print(f"Line vuln logits std: {line_vuln_logits.std().item():.6f}")
+                    print(f"Vulnerable lines shape: {vulnerable_lines.shape}")
+                    print(f"Vulnerable lines sum: {vulnerable_lines.sum().item()}")
+                    print(f"Vulnerable lines range: [{vulnerable_lines.min().item():.1f}, {vulnerable_lines.max().item():.1f}]")
+                    
+                    # NEW: Check for oscillation in line vulnerability logits
+                    current_logit_mean = line_vuln_logits.mean().item()
+                    current_logit_std = line_vuln_logits.std().item()
+                    
+                    # Only allow oscillation-based scaling after warmup epochs
+                    if epoch >= self.loss_warmup_epochs:
+                        if epoch > 0:
+                            mean_change = abs(current_logit_mean - self.prev_line_logit_mean)
+                            std_change = abs(current_logit_std - self.prev_line_logit_std)
+                            if (mean_change > 5.0 or std_change > 1.0) and not self.oscillation_detected:  # Increased thresholds
+                                print(f"⚠️  OSCILLATION DETECTED!")
+                                print(f"Mean change: {mean_change:.3f} ({self.prev_line_logit_mean:.3f} → {current_logit_mean:.3f})")
+                                print(f"Std change: {std_change:.3f} ({self.prev_line_logit_std:.3f} → {current_logit_std:.3f})")
+                                self.oscillation_detected = True
+                                self.consecutive_oscillations += 1
+                                self.line_loss_scale = max(self.min_line_loss_scale, self.line_loss_scale * 0.5)  # Less aggressive reduction
+                                print(f"Reduced line loss scale to: {self.line_loss_scale:.3f}")
+                                self.stability_factor = max(0.5, self.stability_factor * 0.7)  # Less aggressive reduction
+                                print(f"Reduced stability factor to: {self.stability_factor:.3f}")
+                            self.prev_line_logit_mean = current_logit_mean
+                            self.prev_line_logit_std = current_logit_std
+                        else:
+                            self.prev_line_logit_mean = current_logit_mean
+                            self.prev_line_logit_std = current_logit_std
+                    else:
+                        # During warmup, keep line_loss_scale at 1.0
+                        self.line_loss_scale = 1.0
+                
+                try:
+                    # Convert logits to probabilities
+                    line_vuln_probs = torch.sigmoid(line_vuln_logits)
+                    
+                    # NEW: Use adaptive thresholding instead of fixed 0.5
+                    # Calculate threshold based on the top 1% of predictions (more conservative)
+                    if line_vuln_probs.numel() > 0:
+                        if line_vuln_logits.mean().item() < -1.0:
+                            # If logits are negative, use a very low threshold
+                            base_threshold = torch.quantile(line_vuln_probs, 0.99).item()
+                            threshold = min(base_threshold, 0.4)  # Lower threshold
+                            threshold = max(threshold, 0.1)  # Higher minimum
+                            print(f"⚠️  Using conservative thresholds due to negative logits")
+                        else:
+                            base_threshold = torch.quantile(line_vuln_probs, 0.99).item()
+                            threshold = min(base_threshold, 0.6)  # Higher threshold
+                            threshold = max(threshold, 0.3)  # Higher minimum
+                    
+                    # Calculate binary predictions with adaptive threshold
+                    line_vuln_preds = (line_vuln_probs > threshold).float()
+                    
+                    # NEW: Track predictions for monitoring
+                    self.total_line_predictions += line_vuln_preds.sum().item()
+                    if line_vuln_preds.sum().item() > 0:
+                        self.batches_with_predictions += 1
+                    
+                    # NEW: Fallback mechanism - if too many predictions, use a higher threshold
+                    if line_vuln_preds.sum().item() > 10000:  # If too many predictions
+                        # Use a much higher threshold to be more selective
+                        conservative_threshold = min(0.8, torch.quantile(line_vuln_probs, 0.995).item())
+                        line_vuln_preds = (line_vuln_probs > conservative_threshold).float()
+                        if batch_idx == 0:
+                            print(f"⚠️  Too many predictions with threshold {threshold:.6f}, using conservative threshold {conservative_threshold:.6f}")
+                            print(f"Conservative predictions: {line_vuln_preds.sum().item()}")
+                    
+                    # NEW: Ultra-fallback mechanism for very aggressive models
+                    if line_vuln_preds.sum().item() > 5000:
+                        # If still too many predictions, use very high threshold
+                        ultra_conservative_threshold = min(0.9, torch.quantile(line_vuln_probs, 0.999).item())
+                        line_vuln_preds = (line_vuln_probs > ultra_conservative_threshold).float()
+                        if batch_idx == 0:
+                            print(f"🚨  Still too many predictions! Using ultra-conservative threshold {ultra_conservative_threshold:.6f}")
+                            print(f"Ultra-conservative predictions: {line_vuln_preds.sum().item()}")
+                    
+                    # NEW: Fallback mechanism - if no predictions, use a lower threshold
+                    if line_vuln_preds.sum().item() == 0 and line_vuln_probs.max().item() > 0.1:
+                        # If no predictions but we have any reasonable probabilities, use a much lower threshold
+                        fallback_threshold = min(0.3, line_vuln_probs.max().item() * 0.5)
+                        line_vuln_preds = (line_vuln_probs > fallback_threshold).float()
+                        if batch_idx == 0:
+                            print(f"⚠️  No predictions with threshold {threshold:.6f}, using fallback threshold {fallback_threshold:.6f}")
+                            print(f"Fallback predictions: {line_vuln_preds.sum().item()}")
+                    
+                    # NEW: Ultra-fallback mechanism for very conservative models
+                    if line_vuln_preds.sum().item() == 0:
+                        # If still no predictions, use very low threshold
+                        ultra_fallback_threshold = max(0.01, line_vuln_probs.max().item() * 0.3)
+                        line_vuln_preds = (line_vuln_probs > ultra_fallback_threshold).float()
+                        if batch_idx == 0:
+                            print(f"🚨  Ultra-conservative model detected! Using ultra-fallback threshold {ultra_fallback_threshold:.6f}")
+                            print(f"Ultra-fallback predictions: {line_vuln_preds.sum().item()}")
+                            print(f"This will force some predictions to encourage learning")
+                    
+                    # NEW: Debug predictions
+                    if batch_idx == 0:
+                        print(f"Line vuln probs range: [{line_vuln_probs.min().item():.6f}, {line_vuln_probs.max().item():.6f}]")
+                        print(f"Adaptive threshold: {threshold:.6f}")
+                        print(f"Line vuln preds sum: {line_vuln_preds.sum().item()}")
+                        print(f"Line vuln preds shape: {line_vuln_preds.shape}")
+                        print(f"Top 1% probability: {torch.quantile(line_vuln_probs, 0.99).item():.6f}")
+                        print(f"Top 0.5% probability: {torch.quantile(line_vuln_probs, 0.995).item():.6f}")
+                        print(f"Top 0.1% probability: {torch.quantile(line_vuln_probs, 0.999).item():.6f}")
+                        print(f"Warm-up factor: {warmup_factor:.3f}, Adjusted weight: {line_vuln_weight_adjusted:.1f}")
+                        print(f"Probabilities above threshold: {(line_vuln_probs > threshold).sum().item()}")
+                        print(f"Threshold selection: min={max(0.1, torch.quantile(line_vuln_probs, 0.99).item()):.6f}, max=0.6, final={threshold:.6f}")
+                        print(f"Stability factor: {self.stability_factor:.3f}")
+                    
+                    # FIXED: Handle the shape mismatch - targets are transposed
+                    if line_vuln_preds.shape != vulnerable_lines.shape:
+                        # Check if dimensions are transposed
+                        if (line_vuln_preds.shape[0] == vulnerable_lines.shape[0] and 
+                            line_vuln_preds.shape[1] == vulnerable_lines.shape[2] and 
+                            line_vuln_preds.shape[2] == vulnerable_lines.shape[1]):
+                            # Transpose the targets to match predictions
+                            vulnerable_lines_flat = vulnerable_lines.transpose(1, 2).contiguous()
+                        else:
+                            # Flatten both to [batch_size * seq_len * num_vuln_types]
+                            line_vuln_preds = line_vuln_preds.view(-1)
+                            vulnerable_lines_flat = vulnerable_lines.view(-1)
+                    else:
+                        vulnerable_lines_flat = vulnerable_lines
+                    
+                    # Calculate metrics with proper shape handling
+                    correct_predictions = ((line_vuln_preds == vulnerable_lines_flat.float()) & (vulnerable_lines_flat.float() == 1)).sum().item()
+                    total_vulnerable = vulnerable_lines_flat.sum().item()
+                    predicted_vulnerable = line_vuln_preds.sum().item()
+                    
+                    if total_vulnerable > 0:
+                        line_vuln_recall = correct_predictions / total_vulnerable
+                    
+                    if predicted_vulnerable > 0:
+                        line_vuln_precision = correct_predictions / predicted_vulnerable
+                    
+                    total_predictions = line_vuln_preds.numel()
+                    if total_predictions > 0:
+                        line_vuln_accuracy = ((line_vuln_preds == vulnerable_lines_flat.float())).sum().item() / total_predictions
+                    
+                    # NEW: Debug metrics
+                    if batch_idx == 0:
+                        print(f"Correct predictions: {correct_predictions}")
+                        print(f"Total vulnerable: {total_vulnerable}")
+                        print(f"Predicted vulnerable: {predicted_vulnerable}")
+                        print(f"Line accuracy: {line_vuln_accuracy:.4f}")
+                        print(f"Line precision: {line_vuln_precision:.4f}")
+                        print(f"Line recall: {line_vuln_recall:.4f}")
+                        print("=" * 50)
+                        
+                except Exception as e:
+                    print(f"Error calculating line metrics: {str(e)}")
+                    # Set default values if calculation fails
+                    line_vuln_accuracy = 0.0
+                    line_vuln_precision = 0.0
+                    line_vuln_recall = 0.0
+                
+                # Calculate batch vulnerability statistics
                 batch_contract_vulns = contract_vulnerabilities.sum().item()
                 batch_line_vulns = vulnerable_lines.sum().item()
                 batch_size = contract_vulnerabilities.size(0)
                 
-                # Adjust focal loss alpha based on vulnerability rate in this batch
-                if batch_contract_vulns > 0:
-                    # If we have vulnerabilities, use more aggressive focal loss
-                    self.contract_focal_loss.alpha = 0.05  # More focus on positive cases
-                    self.contract_focal_loss.gamma = 4.0  # More aggressive down-weighting
-                else:
-                    # If no vulnerabilities, use balanced focal loss
-                    self.contract_focal_loss.alpha = 0.1
-                    self.contract_focal_loss.gamma = 3.0
-                
-                # IMPROVED: Dynamic line vulnerability loss adjustment
+                # IMPROVED: Balanced line vulnerability loss adjustment
                 if batch_line_vulns > 0:
-                    # If we have line vulnerabilities, use very aggressive focal loss
-                    self.spatial_focal_loss.alpha = 0.005  # Very low alpha for extreme imbalance
-                    self.spatial_focal_loss.gamma = 5.0  # Very aggressive down-weighting
-                    self.spatial_focal_loss.spatial_weight = 0.5  # Higher spatial weight
+                    # If we have line vulnerabilities, use less aggressive focal loss
+                    self.spatial_focal_loss.alpha = 0.1  # Lower alpha for stability
+                    self.spatial_focal_loss.gamma = 1.5  # Lower gamma for stability
+                    self.spatial_focal_loss.spatial_weight = 0.1  # Lower spatial weight
                 else:
-                    # If no line vulnerabilities, use standard settings
-                    self.spatial_focal_loss.alpha = 0.01
-                    self.spatial_focal_loss.gamma = 4.0
-                    self.spatial_focal_loss.spatial_weight = 0.3
+                    # If no line vulnerabilities, use very conservative settings
+                    self.spatial_focal_loss.alpha = 0.05  # Very low alpha
+                    self.spatial_focal_loss.gamma = 1.0  # Very low gamma
+                    self.spatial_focal_loss.spatial_weight = 0.05  # Very low spatial weight
                 
                 # Apply minimum loss thresholds to prevent losses from going to zero
                 contract_vuln_loss = torch.max(contract_vuln_loss, torch.tensor(0.0001).to(self.device))
-                line_vuln_loss = torch.max(line_vuln_loss, torch.tensor(0.00001).to(self.device))  # Increased from 0.01
+                line_vuln_loss = torch.max(line_vuln_loss, torch.tensor(0.000001).to(self.device))  # Much smaller minimum for line loss
+                
+                # NEW: Add gradient scaling for line vulnerability loss to prevent gradient explosion
+                if line_vuln_loss > 5.0:
+                    line_vuln_loss = line_vuln_loss * 0.1  # Scale down high losses
+                    print(f"⚠️  High line vulnerability loss detected: {line_vuln_loss.item():.6f}, scaling down")
+                elif line_vuln_loss > 1.0:
+                    line_vuln_loss = line_vuln_loss * 0.5  # Scale down moderately high losses
+                    print(f"⚠️  Moderately high line vulnerability loss detected: {line_vuln_loss.item():.6f}, scaling down")
                 
                 # GAN training with integrated discriminator
                 discriminator_loss = 0.0
@@ -968,33 +1240,34 @@ class SmartContractTrainer:
                         print(f"Error in GAN training: {str(e)}")
                         continue
                 
-                # IMPROVED: Combined loss with much higher weights for line vulnerabilities and syntax awareness
+                # IMPROVED: Balanced loss with equal importance for all components
+                # NEW: Apply warm-up for line vulnerability detection
                 if self.use_augmentation and self.use_gan:
-                    # Much higher weights for vulnerability detection, especially line-level
+                    # Balanced weights for all components
                     total_loss = (
-                        0.1 * gen_loss +  # Reduced from 0.15
-                        0.3 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
-                        0.5 * line_vuln_loss * self.line_vuln_weight +  # Much higher weight for line vulnerabilities
-                        0.1 * discriminator_loss  # Reduced from 0.15
+                        0.5 * gen_loss +  # Generation is important
+                        0.25 * contract_vuln_loss * self.contract_vuln_weight +  # Contract-level detection
+                        0.2 * line_vuln_loss * line_vuln_weight_adjusted +  # Line-level detection with warm-up
+                        0.05 * discriminator_loss  # GAN component
                     )
                 elif self.use_augmentation:
                     total_loss = (
-                        0.15 * gen_loss +  # Reduced from 0.2
-                        0.3 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
-                        0.55 * line_vuln_loss * self.line_vuln_weight  # Much higher weight for line vulnerabilities
+                        0.6 * gen_loss +  # Generation is important
+                        0.25 * contract_vuln_loss * self.contract_vuln_weight +  # Contract-level detection
+                        0.15 * line_vuln_loss * line_vuln_weight_adjusted  # Line-level detection with warm-up
                     )
                 else:
                     total_loss = (
-                        0.1 * gen_loss +  # Reduced from 0.15
-                        0.25 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
-                        0.65 * line_vuln_loss * self.line_vuln_weight  # Much higher weight for line vulnerabilities
+                        0.5 * gen_loss +  # Generation is important
+                        0.3 * contract_vuln_loss * self.contract_vuln_weight +  # Contract-level detection
+                        0.2 * line_vuln_loss * line_vuln_weight_adjusted  # Line-level detection with warm-up
                     )
                 
                 # Add GAN losses to total loss
                 if self.use_gan:
                     # Add adversarial loss if discriminator is too confident
                     if adversarial_loss > 0:
-                        total_loss = total_loss + 0.05 * adversarial_loss
+                        total_loss = total_loss + 0.02 * adversarial_loss  # Reduced from 0.05
                 
                 # Backward pass with gradient clipping
                 self.optimizer.zero_grad()
@@ -1010,11 +1283,12 @@ class SmartContractTrainer:
                     if discriminator_params:
                         torch.nn.utils.clip_grad_norm_(discriminator_params, self.max_grad_norm * 0.3)  # Reduced from 0.5
                 
-                # Clip vulnerability head gradients separately
+                # IMPROVED: Clip vulnerability head gradients separately with higher limits
                 vuln_params = [p for name, p in self.model.named_parameters() 
-                             if 'vulnerability_head' in name or 'spatial_attention' in name]
+                             if 'vulnerability_head' in name or 'line_feature_extractor' in name or 
+                                'line_vuln_attention' in name or 'vuln_type_attention' in name]
                 if vuln_params:
-                    torch.nn.utils.clip_grad_norm_(vuln_params, self.max_grad_norm * 1.5)  # Increased for line vulnerability heads
+                    torch.nn.utils.clip_grad_norm_(vuln_params, self.max_grad_norm * 2.0)  # Moderate limit for line vulnerability heads
                 
                 # Check for gradient explosion after clipping
                 total_norm = 0
@@ -1043,12 +1317,15 @@ class SmartContractTrainer:
                 total_discriminator_loss += discriminator_loss
                 batch_count += 1
                 
-                # Update progress bar
+                # Update progress bar with line-level metrics
                 progress_bar.update(1)
                 progress_bar.set_postfix({
                     'gen_loss': f'{gen_loss.item():.4f}',
                     'contract_vuln_loss': f'{contract_vuln_loss.item():.4f}',
                     'line_vuln_loss': f'{line_vuln_loss.item():.6f}',  # More precision for line loss
+                    'line_acc': f'{line_vuln_accuracy:.3f}',  # NEW: Line accuracy
+                    'line_prec': f'{line_vuln_precision:.3f}',  # NEW: Line precision
+                    'line_rec': f'{line_vuln_recall:.3f}',  # NEW: Line recall
                     'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}',
                     'grad_norm': f'{total_norm:.2f}',
                     'aug': 'ON' if self.use_augmentation else 'OFF',
@@ -1057,7 +1334,9 @@ class SmartContractTrainer:
                     'disc_conf': f'{discriminator_confidence:.3f}' if self.use_gan else 'N/A',
                     'line_weight': f'{self.line_vuln_weight:.0f}',  # Show line vulnerability weight
                     'contract_weight': f'{self.contract_vuln_weight:.0f}',  # Show contract vulnerability weight
-                    'syntax': f'{syntax_penalty.item():.4f}' if syntax_penalty is not None else 'N/A'
+                    'syntax': f'{syntax_penalty.item():.4f}' if syntax_penalty is not None else 'N/A',
+                    'loss_scale': f'{self.line_loss_scale:.2f}',  # NEW: Show loss scale
+                    'stab_factor': f'{self.stability_factor:.2f}'  # NEW: Show stability factor
                 })
                 
             except Exception as e:
@@ -1071,7 +1350,10 @@ class SmartContractTrainer:
             'contract_vuln_loss': total_contract_vuln_loss / batch_count if batch_count > 0 else float('inf'),
             'line_vuln_loss': total_line_vuln_loss / batch_count if batch_count > 0 else float('inf'),
             'discriminator_loss': total_discriminator_loss / batch_count if batch_count > 0 else 0.0,
-            'syntax_loss': total_syntax_loss / batch_count if batch_count > 0 else 0.0
+            'syntax_loss': total_syntax_loss / batch_count if batch_count > 0 else 0.0,
+            'line_vuln_accuracy': line_vuln_accuracy,  # NEW: Return line metrics
+            'line_vuln_precision': line_vuln_precision,  # NEW: Return line metrics
+            'line_vuln_recall': line_vuln_recall  # NEW: Return line metrics
         }
 
     def validate(self):
@@ -1100,6 +1382,10 @@ class SmartContractTrainer:
                     vulnerable_lines = batch['vulnerable_lines']
                     contract_vulnerabilities = batch['contract_vulnerabilities']
                     token_to_line = batch['token_to_line']
+                    
+                    # NEW: Calculate warm-up factor early in the training loop
+                    warmup_factor = min(1.0, (self.current_epoch + 1) / self.warmup_epochs)
+                    line_vuln_weight_adjusted = self.line_vuln_weight * warmup_factor
                     
                     # Handle target_ids based on augmentation setting
                     if self.use_augmentation:
@@ -1141,9 +1427,22 @@ class SmartContractTrainer:
                     )
                     
                     # IMPROVED: Calculate line-level vulnerability loss with spatial awareness
+                    # FIXED: Handle transposed dimensions for vulnerable_lines
+                    if line_vuln_logits.shape != vulnerable_lines.shape:
+                        # Check if dimensions are transposed and fix them
+                        if (line_vuln_logits.shape[0] == vulnerable_lines.shape[0] and 
+                            line_vuln_logits.shape[1] == vulnerable_lines.shape[2] and 
+                            line_vuln_logits.shape[2] == vulnerable_lines.shape[1]):
+                            # Transpose vulnerable_lines to match line_vuln_logits
+                            vulnerable_lines_for_loss = vulnerable_lines.transpose(1, 2).contiguous()
+                        else:
+                            vulnerable_lines_for_loss = vulnerable_lines
+                    else:
+                        vulnerable_lines_for_loss = vulnerable_lines
+                    
                     line_vuln_loss = self.spatial_focal_loss(
                         line_vuln_logits.view(-1, self.model.num_vulnerability_types),
-                        vulnerable_lines.view(-1, self.model.num_vulnerability_types).float(),
+                        vulnerable_lines_for_loss.view(-1, self.model.num_vulnerability_types).float(),
                         token_to_line.view(-1) if token_to_line is not None else None
                     )
                     
@@ -1151,14 +1450,8 @@ class SmartContractTrainer:
                     contract_vuln_loss = torch.max(contract_vuln_loss, torch.tensor(0.0001).to(self.device))
                     line_vuln_loss = torch.max(line_vuln_loss, torch.tensor(0.00001).to(self.device))  # Increased from 0.01
                     
-                    # IMPROVED: Combined loss with higher weights for line vulnerabilities
-                    if self.use_augmentation and self.use_gan:
-                        total_loss = (
-                            0.4 * gen_loss +
-                            0.3 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
-                            0.3 * line_vuln_loss * self.line_vuln_weight  # Use dynamic weight
-                        )
-                    elif self.use_augmentation:
+                    # IMPROVED: Combined loss with balanced weights
+                    if self.use_augmentation:
                         total_loss = (
                             0.6 * gen_loss +
                             0.25 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
@@ -1166,9 +1459,9 @@ class SmartContractTrainer:
                         )
                     else:
                         total_loss = (
-                            0.4 *gen_loss + 
+                            0.5 * gen_loss + 
                             0.3 * contract_vuln_loss * self.contract_vuln_weight +  # Use contract vulnerability weight
-                            0.3 * line_vuln_loss * self.line_vuln_weight  # Use dynamic weight
+                            0.2 * line_vuln_loss * self.line_vuln_weight  # Use dynamic weight
                         )
                     
                     total_gen_loss += gen_loss.item()
@@ -1193,6 +1486,9 @@ class SmartContractTrainer:
         for epoch in range(num_epochs):
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
             
+            # Update current epoch for warm-up
+            self.current_epoch = epoch
+            
             # Training phase
             train_metrics = self.train_epoch(epoch)
             
@@ -1206,21 +1502,127 @@ class SmartContractTrainer:
             self.training_history['line_vuln_loss'].append(train_metrics['line_vuln_loss'])
             self.training_history['learning_rate'].append(self.optimizer.param_groups[0]['lr'])
             
+            # NEW: Track line-level performance metrics
+            self.training_history['line_vuln_accuracy'].append(train_metrics.get('line_vuln_accuracy', 0.0))
+            self.training_history['line_vuln_precision'].append(train_metrics.get('line_vuln_precision', 0.0))
+            self.training_history['line_vuln_recall'].append(train_metrics.get('line_vuln_recall', 0.0))
+            
             if self.use_gan:
                 self.training_history['discriminator_loss'].append(train_metrics['discriminator_loss'])
             
             # NEW: Track syntax loss
             self.training_history['syntax_loss'].append(train_metrics.get('syntax_loss', 0.0))
             
-            # Print metrics
+            # Print metrics with line-level performance
             print(f"Train Loss: {train_metrics['gen_loss']:.4f}")
             print(f"Val Loss: {val_metrics['gen_loss']:.4f}")
             print(f"Contract Vulnerability Loss: {train_metrics['contract_vuln_loss']:.4f}")
             print(f"Line Vulnerability Loss: {train_metrics['line_vuln_loss']:.6f}")
+            print(f"Line Accuracy: {train_metrics.get('line_vuln_accuracy', 0.0):.4f}")  # NEW
+            print(f"Line Precision: {train_metrics.get('line_vuln_precision', 0.0):.4f}")  # NEW
+            print(f"Line Recall: {train_metrics.get('line_vuln_recall', 0.0):.4f}")  # NEW
             if self.use_gan:
                 print(f"Discriminator Loss: {train_metrics['discriminator_loss']:.4f}")
             print(f"Syntax Loss: {train_metrics.get('syntax_loss', 0.0):.4f}")  # NEW: Show syntax loss
             print(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
+            
+            # NEW: Check line-level performance and adjust training if needed
+            line_recall = train_metrics.get('line_vuln_recall', 0.0)
+            line_precision = train_metrics.get('line_vuln_precision', 0.0)
+            
+            # NEW: Reset oscillation detection if model stabilizes
+            if not self.oscillation_detected and epoch > 2:
+                # If no oscillation for 2 epochs, gradually increase loss scale
+                if self.line_loss_scale < 1.0:
+                    self.line_loss_scale = min(1.0, self.line_loss_scale * 1.2)
+                    print(f"Model stabilized. Increasing line loss scale to: {self.line_loss_scale:.3f}")
+                
+                # Also increase stability factor
+                if self.stability_factor < 1.0:
+                    self.stability_factor = min(1.0, self.stability_factor * 1.1)
+                    print(f"Increasing stability factor to: {self.stability_factor:.3f}")
+            
+            # Reset oscillation detection for next epoch
+            self.oscillation_detected = False
+            
+            # NEW: Stability adjustment to prevent oscillation
+            if epoch > 0:  # After first epoch
+                # Check for oscillation between extremes
+                if (self.prev_line_recall > 0.8 and line_recall < 0.1) or (self.prev_line_recall < 0.1 and line_recall > 0.8):
+                    print(f"⚠️  Oscillation detected! Recall: {self.prev_line_recall:.3f} → {line_recall:.3f}")
+                    print("Reducing line vulnerability loss weight to stabilize training...")
+                    self.stability_factor = max(0.3, self.stability_factor * 0.7)  # Reduce by 30%
+                    print(f"Stability factor: {self.stability_factor:.3f}")
+                
+                # Check for extreme precision/recall imbalance
+                if line_precision < 0.01 and line_recall > 0.8:
+                    print(f"⚠️  High recall ({line_recall:.3f}) but very low precision ({line_precision:.3f})")
+                    print("Adjusting loss to improve precision...")
+                    self.spatial_focal_loss.alpha = min(0.5, self.spatial_focal_loss.alpha * 1.2)
+                    self.spatial_focal_loss.gamma = max(1.5, self.spatial_focal_loss.gamma * 0.9)
+                
+                if line_precision > 0.8 and line_recall < 0.1:
+                    print(f"⚠️  High precision ({line_precision:.3f}) but very low recall ({line_recall:.3f})")
+                    print("Adjusting loss to improve recall...")
+                    self.spatial_focal_loss.alpha = max(0.1, self.spatial_focal_loss.alpha * 0.8)
+                    self.spatial_focal_loss.gamma = min(3.0, self.spatial_focal_loss.gamma * 1.1)
+            
+            # Update previous values for next epoch
+            self.prev_line_recall = line_recall
+            self.prev_line_precision = line_precision
+            
+            if line_recall < 0.01 and epoch > 5:  # If line recall is very low after 5 epochs
+                print(f"⚠️  Very low line recall detected: {line_recall:.4f}")
+                print("Boosting line vulnerability learning rate...")
+                
+                # Boost learning rate for line vulnerability heads
+                for param_group in self.optimizer.param_groups:
+                    if any(name in str(param_group) for name in ['line_vulnerability_head', 'spatial_attention', 'line_feature_extractor']):
+                        param_group['lr'] = param_group['lr'] * 2.0
+                        print(f"Boosted line head LR to: {param_group['lr']:.6f}")
+            
+            # NEW: Check if model is consistently making no predictions
+            if line_recall == 0.0 and epoch > 5:  # Increased from 3 to 5
+                print(f"⚠️  Model making no line vulnerability predictions!")
+                print("Applying conservative learning rate boost...")
+                
+                # Boost learning rate conservatively for line vulnerability heads
+                for param_group in self.optimizer.param_groups:
+                    if any(name in str(param_group) for name in ['line_vulnerability_head', 'line_feature_extractor']):
+                        param_group['lr'] = param_group['lr'] * 2.0  # Reduced from 5.0 to 2.0
+                        print(f"Conservatively boosted line head LR to: {param_group['lr']:.6f}")
+                
+                # Also increase loss scale conservatively
+                self.line_loss_scale = min(self.max_line_loss_scale, self.line_loss_scale * 1.5)  # Reduced from 3.0 to 1.5
+                print(f"Conservatively increased line loss scale to: {self.line_loss_scale:.3f}")
+                
+                # Reset stability factor conservatively
+                self.stability_factor = min(1.0, self.stability_factor * 1.2)  # Reduced from 2.0 to 1.2
+                print(f"Reset stability factor to: {self.stability_factor:.3f}")
+            
+            # NEW: Check prediction tracking for more conservative intervention
+            if self.batches_with_predictions == 0 and epoch > 5:  # Increased from 2 to 5
+                print(f"🚨  NO PREDICTIONS IN ANY BATCH!")
+                print(f"Total predictions this epoch: {self.total_line_predictions}")
+                print("Applying conservative emergency intervention...")
+                
+                # Conservative learning rate boost
+                for param_group in self.optimizer.param_groups:
+                    if any(name in str(param_group) for name in ['line_vulnerability_head', 'line_feature_extractor']):
+                        param_group['lr'] = param_group['lr'] * 3.0  # Reduced from 10.0 to 3.0
+                        print(f"Conservative emergency boosted line head LR to: {param_group['lr']:.6f}")
+                
+                # Conservative loss scale
+                self.line_loss_scale = min(self.max_line_loss_scale, self.line_loss_scale * 2.0)  # Reduced from max to 2.0
+                print(f"Set line loss scale to conservative maximum: {self.line_loss_scale:.3f}")
+                
+                # Reset stability factors conservatively
+                self.stability_factor = 0.8  # Reduced from 1.0 to 0.8
+                print(f"Reset stability factor to: {self.stability_factor:.3f}")
+            
+            # Reset prediction tracking for next epoch
+            self.total_line_predictions = 0
+            self.batches_with_predictions = 0
             
             # Step the scheduler with the validation loss
             self.scheduler.step(val_metrics['gen_loss'])
@@ -1273,11 +1675,17 @@ class SmartContractTrainer:
                     'val_loss': val_metrics['gen_loss'],
                     'training_history': self.training_history,
                     'use_augmentation': self.use_augmentation,
-                    'use_gan': self.use_gan
+                    'use_gan': self.use_gan,
+                    'line_vuln_accuracy': train_metrics.get('line_vuln_accuracy', 0.0),  # NEW: Save line metrics
+                    'line_vuln_precision': train_metrics.get('line_vuln_precision', 0.0),  # NEW: Save line metrics
+                    'line_vuln_recall': train_metrics.get('line_vuln_recall', 0.0)  # NEW: Save line metrics
                 }
                 
                 torch.save(checkpoint_data, checkpoint_path)
                 print(f"🎉 New best validation loss! Saved checkpoint to {checkpoint_path}")
+                print(f"Line-level performance: Acc={train_metrics.get('line_vuln_accuracy', 0.0):.4f}, "
+                      f"Prec={train_metrics.get('line_vuln_precision', 0.0):.4f}, "
+                      f"Rec={train_metrics.get('line_vuln_recall', 0.0):.4f}")
             else:
                 self.patience_counter += 1
                 print(f"No improvement for {self.patience_counter} epochs")
@@ -1304,7 +1712,10 @@ class SmartContractTrainer:
                 'val_loss': val_metrics['gen_loss'],
                 'training_history': self.training_history,
                 'use_augmentation': self.use_augmentation,
-                'use_gan': self.use_gan
+                'use_gan': self.use_gan,
+                'line_vuln_accuracy': train_metrics.get('line_vuln_accuracy', 0.0),  # NEW: Save line metrics
+                'line_vuln_precision': train_metrics.get('line_vuln_precision', 0.0),  # NEW: Save line metrics
+                'line_vuln_recall': train_metrics.get('line_vuln_recall', 0.0)  # NEW: Save line metrics
             }
             
             torch.save(checkpoint_data, latest_checkpoint_path)
